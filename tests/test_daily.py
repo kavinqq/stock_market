@@ -18,7 +18,8 @@ def _rows():
 class TestDaily(unittest.TestCase):
     def test_model_prediction_returns_proba(self):
         d = tempfile.mkdtemp(); path = os.path.join(d, "model_tw.json")
-        json.dump(MODEL, open(path, "w"))
+        with open(path, "w") as fh:
+            json.dump(MODEL, fh)
         out = model_prediction("tw", path, _rows(), [])
         self.assertIn(out["bias"], ("偏多", "震盪", "偏空"))
         self.assertTrue(0.0 <= out["probability"] <= 1.0)
@@ -126,7 +127,8 @@ class TestDaily(unittest.TestCase):
         }
         d = tempfile.mkdtemp()
         path = os.path.join(d, "model_tw.json")
-        json.dump(sparse_model, open(path, "w"))
+        with open(path, "w") as fh:
+            json.dump(sparse_model, fh)
         # _rows() is price-only: no chip or US columns -> fewer than half of the
         # 20 canonical TW features are present -> sparsity guard returns None.
         self.assertIsNone(model_prediction("tw", path, _rows(), []))

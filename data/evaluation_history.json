@@ -1,0 +1,80 @@
+{
+  "updated_at": "2026-06-29 11:20:27 CST",
+  "formula_version": "rule-v1.1",
+  "sample_size": 0,
+  "hit_count": 0,
+  "miss_count": 0,
+  "hit_rate": null,
+  "classification_metrics": {
+    "macro_f1": null,
+    "per_class": {
+      "偏多": {
+        "precision": null,
+        "recall": null,
+        "f1": null,
+        "support": 0,
+        "predicted_count": 0
+      },
+      "震盪": {
+        "precision": null,
+        "recall": null,
+        "f1": null,
+        "support": 0,
+        "predicted_count": 0
+      },
+      "偏空": {
+        "precision": null,
+        "recall": null,
+        "f1": null,
+        "support": 0,
+        "predicted_count": 0
+      }
+    },
+    "confusion_matrix": {
+      "偏多": {
+        "偏多": 0,
+        "震盪": 0,
+        "偏空": 0
+      },
+      "震盪": {
+        "偏多": 0,
+        "震盪": 0,
+        "偏空": 0
+      },
+      "偏空": {
+        "偏多": 0,
+        "震盪": 0,
+        "偏空": 0
+      }
+    },
+    "actual_counts": {
+      "偏多": 0,
+      "震盪": 0,
+      "偏空": 0
+    },
+    "prediction_counts": {
+      "偏多": 0,
+      "震盪": 0,
+      "偏空": 0
+    },
+    "actual_distribution": {
+      "偏多": null,
+      "震盪": null,
+      "偏空": null
+    }
+  },
+  "baselines": {
+    "random_prior": {
+      "label": "依實際先驗隨機",
+      "sample_size": 0,
+      "expected_hit_rate": null
+    }
+  },
+  "records": [],
+  "notes": [
+    "這裡保存每日正式預測和後續實際收盤方向的對照",
+    "miss_reason 用來區分公式權重問題、門檻問題、缺少資料源或假日 target 調整",
+    "actual_direction 使用當時預測 JSON 保存的 neutral_threshold_pct；舊資料缺值時才用預設 0.5%",
+    "價量診斷回測留在 daily JSON；正式每日預測驗證累積在此檔案"
+  ]
+}

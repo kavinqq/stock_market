@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>台美股大盤日報 - 2026-06-29</title>
+  <style>
+    :root {
+      --ink: #18212f;
+      --muted: #657085;
+      --line: #d7deea;
+      --paper: #f6f8fb;
+      --panel: #ffffff;
+      --tw: #0f766e;
+      --us: #1d4ed8;
+      --warn: #b45309;
+      --bad: #b42318;
+      --good: #047857;
+      --shadow: 0 10px 30px rgba(24, 33, 47, 0.08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 22px 16px;
+      background: #111827;
+      color: #f8fafc;
+      border-right: 1px solid #0b1220;
+    }
+    .brand { margin-bottom: 24px; }
+    .brand small { display: block; color: #9ca3af; font-size: 12px; }
+    .brand strong { display: block; font-size: 22px; letter-spacing: 0; }
+    .nav { display: grid; gap: 8px; }
+    .nav a {
+      color: #cbd5e1;
+      text-decoration: none;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-weight: 650;
+      outline: none;
+    }
+    .nav a:hover, .nav a:focus, .nav a.active { color: white; background: #243044; }
+    .meta { position: absolute; left: 16px; right: 16px; bottom: 20px; color: #9ca3af; font-size: 12px; }
+    main { padding: 28px; max-width: 1240px; width: 100%; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .hero {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 20px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1, h2, h3 { margin: 0; line-height: 1.18; letter-spacing: 0; }
+    h1 { font-size: clamp(28px, 4vw, 48px); }
+    h2 { font-size: 26px; margin-bottom: 14px; }
+    h3 { font-size: 18px; margin: 22px 0 10px; }
+    .subtle { color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0 22px; }
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-top: 4px solid #94a3b8;
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 128px;
+      box-shadow: var(--shadow);
+    }
+    .metric-good { border-top-color: var(--good); }
+    .metric-bad { border-top-color: var(--bad); }
+    .metric-warn { border-top-color: var(--warn); }
+    .metric-muted { border-top-color: #64748b; }
+    .metric-label { color: var(--muted); font-size: 12px; font-weight: 750; text-transform: uppercase; }
+    .metric-value { font-size: 26px; font-weight: 800; margin-top: 8px; word-break: break-word; }
+    .metric-note { color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      margin: 14px 0;
+      box-shadow: var(--shadow);
+    }
+    .panel.tw { border-left: 5px solid var(--tw); }
+    .panel.us { border-left: 5px solid var(--us); }
+    .pred-good { border-left: 5px solid var(--good); }
+    .pred-bad { border-left: 5px solid var(--bad); }
+    .pred-warn { border-left: 5px solid var(--warn); }
+    ul { margin: 8px 0 0 20px; padding: 0; }
+    li { margin: 7px 0; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .pos { color: var(--good); font-weight: 750; }
+    .neg { color: var(--bad); font-weight: 750; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .stamp { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+    .stamp span { background: #e8eef8; color: #263449; padding: 5px 8px; border-radius: 8px; font-size: 12px; font-weight: 700; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { position: relative; height: auto; }
+      .meta { position: static; margin-top: 20px; }
+      .grid, .split { grid-template-columns: 1fr; }
+      main { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <small>Daily Market Desk</small>
+        <strong>台美股大盤日報</strong>
+      </div>
+      <nav class="nav" aria-label="report pages">
+        <a href="#overview" class="active">總覽</a>
+        <a href="#prediction">預測</a>
+        <a href="#accuracy">準確率</a>
+        <a href="#taiwan">台股</a>
+        <a href="#us">美股</a>
+        <a href="#cross">回推</a>
+        <a href="#sources">資料源</a>
+      </nav>
+      <div class="meta">
+        <div>2026-06-29</div>
+        <div>2026-06-29 11:20:27 CST</div>
+      </div>
+    </aside>
+    <main>
+      <section id="overview" class="page active">
+        <div class="hero">
+          <h1>台美股大盤日報</h1>
+          <div class="subtle">台股資料日 2026-06-26；美股資料日 2026-06-26</div>
+          <div class="stamp"><span>技術</span><span>量價</span><span>籌碼</span><span>風險</span><span>基本面未納入</span></div>
+        </div>
+        <div class="grid"><article class="metric metric-bad"><div class="metric-label">台股收盤</div><div class="metric-value">44,571.76</div><div class="metric-note">-3.64% / 多頭修正</div></article><article class="metric metric-warn"><div class="metric-label">台股量能</div><div class="metric-value">1.17</div><div class="metric-note">前20日均量比，量能正常下跌</div></article><article class="metric metric-bad"><div class="metric-label">SPY</div><div class="metric-value">728.99</div><div class="metric-note">-0.72% / 多頭修正</div></article><article class="metric metric-warn"><div class="metric-label">VIX</div><div class="metric-value">18.41</div><div class="metric-note">VIX 18.41，波動預期中性，日變動 -2.54%</div></article></div>
+        <div class="panel">
+          <h2>分析層面</h2>
+          <div class="grid"><article class="metric metric-good"><div class="metric-label">技術面</div><div class="metric-value">有</div><div class="metric-note">1/5/20/60日漲跌、均線、20日支撐壓力、高點回落</div></article><article class="metric metric-good"><div class="metric-label">籌碼面</div><div class="metric-value">有</div><div class="metric-note">台股融資/融券、三大法人；美股 FINRA margin debt</div></article><article class="metric metric-warn"><div class="metric-label">量價/風險</div><div class="metric-value">有</div><div class="metric-note">成交量或成交金額對前20日均量、VIX、跨市場回推</div></article><article class="metric metric-muted"><div class="metric-label">基本面</div><div class="metric-value">未納入</div><div class="metric-note">尚未抓 PE、PB、EPS、殖利率、利率與總經資料</div></article></div>
+        </div>
+        <div class="panel">
+          <h2>當日結論</h2>
+          <ul><li>台股：多頭修正，量能正常下跌，下跌且融資減少，代表去槓桿正在發生，急跌後風險有部分釋放。</li><li>美股：SPY 多頭修正，QQQ 多頭修正，量能正常下跌，VIX 18.41，波動預期中性，日變動 -2.54%。</li><li>回推：美國科技股偏弱但台股仍強，台股有相對強勢，但隔夜美股風險要盯。</li></ul>
+        </div>
+      </section>
+
+      <section id="prediction" class="page">
+        <div class="hero">
+          <h1>下一交易日走勢預測</h1>
+          <div class="subtle">用規則式訊號產生方向、信心、分數與失準調校所需的理由紀錄。</div>
+        </div>
+        <div class="grid"><article class="metric metric-bad"><div class="metric-label">台股下次開盤</div><div class="metric-value">偏空</div><div class="metric-note">2026-06-29 / 信心 中</div></article><article class="metric metric-warn"><div class="metric-label">台股分數</div><div class="metric-value">-2.15</div><div class="metric-note">-2.50% ~ +1.21%</div></article><article class="metric metric-bad"><div class="metric-label">美股下次開盤</div><div class="metric-value">偏空</div><div class="metric-note">2026-06-29 / 信心 低</div></article><article class="metric metric-warn"><div class="metric-label">美股分數</div><div class="metric-value">-1.05</div><div class="metric-note">-1.74% ~ +1.11%</div></article></div>
+        <div class="panel pred-bad"><h2>台股</h2><div class="grid"><article class="metric metric-neutral"><div class="metric-label">目標交易日</div><div class="metric-value">2026-06-29</div><div class="metric-note">下一個交易日收盤方向</div></article><article class="metric metric-bad"><div class="metric-label">方向</div><div class="metric-value">偏空</div><div class="metric-note">信心 中</div></article><article class="metric metric-warn"><div class="metric-label">分數</div><div class="metric-value">-2.15</div><div class="metric-note">公式 rule-v1.1</div></article><article class="metric metric-neutral"><div class="metric-label">預估區間</div><div class="metric-value">-2.50% ~ +1.21%</div><div class="metric-note">下一交易日收盤報酬</div></article><article class="metric metric-muted"><div class="metric-label">震盪判定</div><div class="metric-value">0.90%</div><div class="metric-note">實際驗證使用的中性帶</div></article></div><h3>理由</h3><ul><li>收盤跌破20日線，短線動能偏弱</li><li>20日線高於60日線，中期趨勢仍有支撐</li><li>5日報酬為負，短線慣性偏空</li><li>自20日高點回落超過5%，回檔壓力仍在</li><li>下跌且融資減少，已有部分去槓桿</li><li>三大法人賣超占成交金額超過5%，籌碼偏空</li><li>漲跌家數比低於0.5，市場廣度偏弱</li><li>QQQ 單日跌幅超過1%，台股科技權值股隔日承壓</li></ul><h3>缺資料 / 限制</h3><ul><li>未接交易所假日曆，target_date 只用週末推估</li></ul><p class="subtle">預測只用規則式訊號，尚未納入消息面、匯率、期貨夜盤與估值資料。</p></div>
+        <div class="panel pred-bad"><h2>美股</h2><div class="grid"><article class="metric metric-neutral"><div class="metric-label">目標交易日</div><div class="metric-value">2026-06-29</div><div class="metric-note">下一個交易日收盤方向</div></article><article class="metric metric-bad"><div class="metric-label">方向</div><div class="metric-value">偏空</div><div class="metric-note">信心 低</div></article><article class="metric metric-warn"><div class="metric-label">分數</div><div class="metric-value">-1.05</div><div class="metric-note">公式 rule-v1.1</div></article><article class="metric metric-neutral"><div class="metric-label">預估區間</div><div class="metric-value">-1.74% ~ +1.11%</div><div class="metric-note">下一交易日收盤報酬</div></article><article class="metric metric-muted"><div class="metric-label">震盪判定</div><div class="metric-value">0.43%</div><div class="metric-note">實際驗證使用的中性帶</div></article></div><h3>理由</h3><ul><li>收盤跌破20日線，短線動能偏弱</li><li>20日線高於60日線，中期趨勢仍有支撐</li><li>5日報酬為負，短線慣性偏空</li><li>QQQ 20日跌幅超過3%，大型科技股動能偏弱</li><li>IWM 相對 SPY 強，小型股風險偏好尚可</li><li>FINRA 融資餘額月增偏快，回檔時槓桿波動可能放大</li></ul><h3>缺資料 / 限制</h3><ul><li>未接 NYSE/Nasdaq 假日曆，target_date 只用週末推估</li></ul><p class="subtle">預測只用規則式訊號，尚未納入盤前期貨、利率、美元與重大新聞。</p></div>
+      </section>
+
+      <section id="accuracy" class="page">
+        <div class="hero">
+          <h1>準確率測試</h1>
+          <div class="subtle">每天自動讀取過去 JSON 預測，對照目前已取得的實際收盤資料。</div>
+        </div>
+        <div class="grid"><article class="metric metric-neutral"><div class="metric-label">台股價量診斷</div><div class="metric-value">31.25%</div><div class="metric-note">樣本 32 / 永遠偏多 43.75% / 動能 28.12% / 隨機先驗 35.74%</div></article><article class="metric metric-neutral"><div class="metric-label">美股價量診斷</div><div class="metric-value">34.29%</div><div class="metric-note">樣本 35 / 永遠偏多 28.57% / 動能 28.57% / 隨機先驗 35.67%</div></article><article class="metric metric-warn"><div class="metric-label">正式預測</div><div class="metric-value">N/A</div><div class="metric-note">樣本 0 / 每日報告對照</div></article><article class="metric metric-warn"><div class="metric-label">Macro-F1</div><div class="metric-value">N/A</div><div class="metric-note">正式預測三分類品質；樣本少時僅供觀察</div></article><article class="metric metric-bad"><div class="metric-label">失準待調校</div><div class="metric-value">10</div><div class="metric-note">原因會留在 JSON 與本頁表格</div></article></div>
+        <div class="panel">
+          <h2>正式每日預測驗證</h2>
+          <p class="subtle">這裡才是每天報告產出的預測與後續真實盤勢對照；價量診斷回測只檢查歷史價格與量能子模型。</p>
+          <table>
+            <thead><tr><th>市場</th><th>目標日</th><th>預測</th><th>實際</th><th>失準原因</th></tr></thead>
+            <tbody><tr><td colspan="5">目前沒有可顯示的失準紀錄</td></tr></tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h2>Baseline 對照</h2>
+          <ul><li>台股價量診斷：模型 31.25%；永遠偏多 43.75% / 動能 28.12% / 隨機先驗 35.74%；macro-F1 33.99%。</li><li>美股價量診斷：模型 34.29%；永遠偏多 28.57% / 動能 28.57% / 隨機先驗 35.67%；macro-F1 30.87%。</li><li>若模型長期贏不了永遠偏多或今日方向延續，代表規則沒有可用 edge，應優先調整資料源或公式。</li></ul>
+        </div>
+        <div class="panel">
+          <h2>近期失準 / 待調校</h2>
+          <table>
+            <thead><tr><th>市場</th><th>日期</th><th>預測</th><th>實際</th><th>原因</th></tr></thead>
+            <tbody><tr><td>台股</td><td>2026-06-17</td><td>N/A</td><td>N/A</td><td>公式權重過強：訊號分數過度放大但實際盤整</td></tr><tr><td>台股</td><td>2026-06-23</td><td>N/A</td><td>N/A</td><td>缺少資料源或公式不足：未納入消息面、期貨、利率/匯率或籌碼歷史</td></tr><tr><td>台股</td><td>2026-06-24</td><td>N/A</td><td>N/A</td><td>缺少資料源或公式不足：未納入消息面、期貨、利率/匯率或籌碼歷史</td></tr><tr><td>台股</td><td>2026-06-25</td><td>N/A</td><td>N/A</td><td>公式權重過強：訊號分數過度放大但實際盤整</td></tr><tr><td>台股</td><td>2026-06-26</td><td>N/A</td><td>N/A</td><td>缺少資料源或公式不足：未納入消息面、期貨、利率/匯率或籌碼歷史</td></tr><tr><td>美股</td><td>2026-06-16</td><td>N/A</td><td>N/A</td><td>缺少資料源或公式不足：未納入消息面、期貨、利率/匯率或籌碼歷史</td></tr><tr><td>美股</td><td>2026-06-17</td><td>N/A</td><td>N/A</td><td>缺少資料源或公式不足：未納入消息面、期貨、利率/匯率或籌碼歷史</td></tr><tr><td>美股</td><td>2026-06-18</td><td>N/A</td><td>N/A</td><td>公式門檻過保守：預測震盪但實際出現單邊走勢</td></tr><tr><td>美股</td><td>2026-06-23</td><td>N/A</td><td>N/A</td><td>公式門檻過保守：預測震盪但實際出現單邊走勢</td></tr><tr><td>美股</td><td>2026-06-26</td><td>N/A</td><td>N/A</td><td>公式門檻過保守：預測震盪但實際出現單邊走勢</td></tr></tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h2>限制</h2>
+          <ul><li>價量診斷回測不是正式模型完整回測；未回填歷史融資、法人、VIX 或 FINRA 月資料</li><li>報告會同時列出永遠偏多、今日方向延續、依實際先驗隨機等 baseline</li><li>正確率定義為下一交易日收盤方向：偏多 / 偏空 / 震盪</li><li>震盪門檻為近60日收盤日報酬波動的一半，並限制在 0.3% 到 0.9%</li><li>只有從 rule-v1.1 開始產出的 JSON 才含可驗證預測</li><li>若 target_date 遇到假日，需等實際資料日出現後才會被納入驗證</li></ul>
+        </div>
+      </section>
+
+      <section id="taiwan" class="page">
+        <div class="hero">
+          <h1>台股</h1>
+          <div class="subtle">TWSE 加權指數、成交金額、融資融券、三大法人與族群表現。</div>
+        </div>
+        <div class="grid"><article class="metric metric-neutral"><div class="metric-label">加權指數</div><div class="metric-value">44,571.76</div><div class="metric-note">20日 +2.14%</div></article><article class="metric metric-warn"><div class="metric-label">成交金額比</div><div class="metric-value">1.17</div><div class="metric-note">相對前20日平均成交金額</div></article><article class="metric metric-bad"><div class="metric-label">融資餘額</div><div class="metric-value">5,909.3 億</div><div class="metric-note">單日 -200.7 億</div></article><article class="metric metric-bad"><div class="metric-label">法人合計</div><div class="metric-value">-2,038.2 億</div><div class="metric-note">外資 -1,431.9 億 / 投信 101.0 億</div></article></div>
+        <div class="panel tw">
+          <h2>台股大盤</h2>
+          <ul><li>加權指數 44,571.76，日變動 -3.64%，5日 -4.07%，20日 +2.14%；技術狀態：多頭修正。</li><li>量能：量能正常下跌，成交金額 / 前20日均量比 1.17；20日高點回落 -6.64%。</li><li>廣度：上市股票漲跌家數比約 0.08，低於 1 代表下跌家數較多。</li><li>融資：餘額 5,909.3 億，單日變化 -200.7 億；下跌且融資減少，代表去槓桿正在發生，急跌後風險有部分釋放。</li><li>法人：合計 -2,038.2 億，外資 -1,431.9 億，投信 101.0 億。</li></ul>
+        </div>
+        <div class="panel">
+          <h2>觀察價位</h2>
+          <ul><li>20日區間支撐 43,149.46</li><li>20日區間壓力 47,741.51</li><li>20日線 45,342.43，60日線 41,089.73</li></ul>
+        </div>
+        <div class="panel">
+          <h2>族群</h2>
+          <table>
+            <thead><tr><th>指數</th><th>收盤</th><th>日變動</th></tr></thead>
+            <tbody><tr><td>發行量加權股價指數</td><td>44,571.76</td><td class="neg">-3.64%</td></tr><tr><td>臺灣50指數</td><td>41,144.70</td><td class="neg">-3.49%</td></tr><tr><td>臺灣中型100指數</td><td>36,003.22</td><td class="neg">-4.43%</td></tr><tr><td>電子工業類指數</td><td>2,858.50</td><td class="neg">-3.91%</td></tr><tr><td>半導體類指數</td><td>1,516.72</td><td class="neg">-3.41%</td></tr><tr><td>電腦及週邊設備類指數</td><td>380.57</td><td class="neg">-5.05%</td></tr><tr><td>航運類指數</td><td>179.73</td><td class="neg">-2.30%</td></tr><tr><td>金融保險類指數</td><td>3,150.96</td><td class="neg">-1.70%</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="us" class="page">
+        <div class="hero">
+          <h1>美股</h1>
+          <div class="subtle">SPY/QQQ/IWM 作為大盤、科技與小型股代理，搭配 VIX 與 FINRA margin debt。</div>
+        </div>
+        <div class="grid"><article class="metric metric-neutral"><div class="metric-label">SPY</div><div class="metric-value">728.99</div><div class="metric-note">20日 -3.39%</div></article><article class="metric metric-neutral"><div class="metric-label">QQQ</div><div class="metric-value">706.52</div><div class="metric-note">20日 -3.95%</div></article><article class="metric metric-neutral"><div class="metric-label">IWM</div><div class="metric-value">299.83</div><div class="metric-note">20日 +2.67%</div></article><article class="metric metric-warn"><div class="metric-label">FINRA 融資</div><div class="metric-value">1.42 兆美元</div><div class="metric-note">May-26 / 月變動 +8.53%</div></article></div>
+        <div class="panel us">
+          <h2>美股大盤</h2>
+          <ul><li>SPY 728.99，日變動 -0.72%，5日 -2.38%，20日 -3.39%；技術狀態：多頭修正。</li><li>QQQ 日變動 -1.38% / 20日 -3.95%，IWM 日變動 +0.31% / 20日 +2.67%；用來觀察大型科技與小型股是否同向。</li><li>量能：SPY 量能正常下跌，成交量 / 前20日均量比 1.16；VIX：VIX 18.41，波動預期中性，日變動 -2.54%。</li><li>槓桿：美股融資餘額月增明顯，槓桿偏熱；debit/free credit 約 3.34 倍，回檔時波動容易放大。</li><li>FINRA margin debt：May-26 debit balance 1.42 兆美元，月變動 +8.53%，年變動 +53.70%。</li></ul>
+        </div>
+        <div class="panel">
+          <h2>觀察價位</h2>
+          <div class="split">
+            <div>
+              <h3>SPY</h3>
+              <ul><li>20日區間支撐 725.43</li><li>20日區間壓力 759.57</li><li>20日線 743.60，60日線 724.40</li></ul>
+            </div>
+            <div>
+              <h3>QQQ</h3>
+              <ul><li>20日區間支撐 693.69</li><li>20日區間壓力 746.16</li><li>20日線 724.76，60日線 686.61</li></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="cross" class="page">
+        <div class="hero">
+          <h1>回推</h1>
+          <div class="subtle">用台股、美國科技股、量能、VIX 與槓桿背景判斷隔日風險。</div>
+        </div>
+        <div class="panel">
+          <h2>跨市場訊號</h2>
+          <ul><li>美國科技股偏弱但台股仍強，台股有相對強勢，但隔夜美股風險要盯。</li></ul>
+        </div>
+        <div class="panel">
+          <h2>規則</h2>
+          <ul><li>價格跌破 20 日線且放量，優先視為供給壓力；若隔日縮量止跌，才改看整理。</li><li>融資增加搭配下跌，通常代表槓桿尚未洗乾淨；融資減少搭配下跌，則是去槓桿正在發生。</li><li>美股 margin debt 是月資料，不適合判斷單日轉折，適合判斷槓桿背景溫度。</li></ul>
+        </div>
+      </section>
+
+      <section id="sources" class="page">
+        <div class="hero">
+          <h1>資料源</h1>
+          <div class="subtle">全部由腳本自動抓取，沒有呼叫 LLM。</div>
+        </div>
+        <div class="panel">
+          <ul><li>TWSE FMTQIK：台股每日成交資訊</li><li>TWSE MI_MARGN：上市信用交易統計</li><li>TWSE BFI82U：三大法人買賣金額統計</li><li>Nasdaq historical API：SPY / QQQ / IWM / COMP 價量資料</li><li>Cboe VIX History：VIX 日資料</li><li>FINRA Margin Statistics：美股 margin debt 月資料</li></ul>
+          <p class="subtle">註：這是規則式市場分析，不是投資建議。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script>
+    const pages = Array.from(document.querySelectorAll(".page"));
+    const links = Array.from(document.querySelectorAll(".nav a"));
+    function showPage(hash) {
+      const id = (hash || "#overview").replace("#", "");
+      pages.forEach((page) => page.classList.toggle("active", page.id === id));
+      links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+      if (!document.getElementById(id)) showPage("#overview");
+    }
+    links.forEach((link) => link.addEventListener("click", () => showPage(link.getAttribute("href"))));
+    window.addEventListener("hashchange", () => showPage(location.hash));
+    showPage(location.hash);
+  </script>
+</body>
+</html>

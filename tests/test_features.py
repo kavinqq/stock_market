@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from marketlib.features import decision_time_for, is_available, usable_value, zscore_excluding_t, realized_vol, volume_ratio_excluding_t
+from marketlib.features import build_dataset, latest_usable_us, build_feature_row
 
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -44,6 +45,40 @@ class TestWindowPolicy(unittest.TestCase):
 def pstdev_helper(xs):
     from statistics import pstdev
     return pstdev(xs)
+
+def _tw_row(d, close, vol=1e9, turnover=5e11):
+    return {"date": d, "close": close, "volume": vol, "turnover": turnover,
+            "price_asof_taipei": f"{d}T14:30:00+08:00",
+            "available_at_taipei": f"{d}T14:30:00+08:00"}
+
+def _us_row(d, spy):
+    from marketlib.fetchers import us_price_asof
+    return {"date": d, "spy_close": spy, "qqq_close": spy, "spy_volume": 1e8,
+            "vix_close": 18.0,
+            "price_asof_taipei": us_price_asof(d)}
+
+class TestDataset(unittest.TestCase):
+    def test_us_lag_one_session(self):
+        # 台股 2026-06-26 預測,US 2026-06-26 收盤次日凌晨才可用 -> 只能用 06-25
+        dt = decision_time_for("2026-06-26")
+        us = [_us_row("2026-06-25", 100.0), _us_row("2026-06-26", 200.0)]
+        latest = latest_usable_us(us, dt)
+        self.assertEqual(latest["date"], "2026-06-25")
+
+    def test_label_is_next_day_up(self):
+        rows = [_tw_row(f"2026-06-{d:02d}", close) for d, close in
+                [(1, 100), (2, 101), (3, 100)]]
+        ds = build_dataset("tw", rows, [])
+        # 第 0 筆:隔日 101>100 -> label 1;最後一筆 label None
+        self.assertEqual(ds[0]["label"], 1)
+        self.assertIsNone(ds[-1]["label"])
+
+    def test_feature_row_has_named_keys(self):
+        rows = [_tw_row(f"2026-06-{d:02d}", 100 + d) for d in range(1, 30)]
+        dt = decision_time_for(rows[-1]["date"])
+        feats = build_feature_row("tw", rows, len(rows) - 1, [], dt)
+        self.assertIn("ret_1d", feats)
+        self.assertIn("close_vs_ma20", feats)
 
 if __name__ == "__main__":
     unittest.main()

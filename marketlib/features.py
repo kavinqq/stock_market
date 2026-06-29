@@ -22,3 +22,28 @@ def usable_value(row: dict, value_col: str, asof_col: str,
     if not is_available(row.get(asof_col), decision_time):
         return None
     return row.get(value_col)
+
+def zscore_excluding_t(series: list[float], n: int) -> Optional[float]:
+    vals = [v for v in series if v is not None]
+    if len(vals) < n + 1:
+        return None
+    baseline = vals[-n - 1:-1]
+    sd = pstdev(baseline)
+    if sd == 0:
+        return None
+    return (vals[-1] - mean(baseline)) / sd
+
+def realized_vol(returns: list[float], n: int) -> Optional[float]:
+    vals = [r for r in returns if r is not None]
+    if len(vals) < n:
+        return None
+    return pstdev(vals[-n:])
+
+def volume_ratio_excluding_t(volumes: list[float], n: int = 20) -> Optional[float]:
+    vals = [v for v in volumes if v is not None]
+    if len(vals) < n + 1:
+        return None
+    base = mean(vals[-n - 1:-1])
+    if base == 0:
+        return None
+    return vals[-1] / base

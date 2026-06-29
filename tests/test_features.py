@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from marketlib.features import decision_time_for, is_available, usable_value
+from marketlib.features import decision_time_for, is_available, usable_value, zscore_excluding_t, realized_vol, volume_ratio_excluding_t
 
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -25,6 +25,25 @@ class TestGating(unittest.TestCase):
         }
         self.assertEqual(usable_value(row, "close", "price_asof_taipei", dt), 100.0)
         self.assertIsNone(usable_value(row, "inst_total_net_ntd", "inst_asof_taipei", dt))
+
+class TestWindowPolicy(unittest.TestCase):
+    def test_zscore_excludes_t(self):
+        # 基準前 4 個都=10(std=0 -> 回 None 以免除以零);改成有變異
+        series = [10, 12, 8, 10, 20]  # 基準=[10,12,8,10] mean=10 std≈1.414
+        z = zscore_excluding_t(series, 4)
+        self.assertAlmostEqual(z, (20 - 10) / pstdev_helper([10, 12, 8, 10]), places=4)
+
+    def test_realized_vol_includes_t(self):
+        rets = [0.01, -0.01, 0.02, -0.02]
+        self.assertAlmostEqual(realized_vol(rets, 4), pstdev_helper(rets), places=6)
+
+    def test_volume_ratio_excludes_t(self):
+        vols = [100, 100, 100, 200]  # 前 3 均=100,今日=200
+        self.assertAlmostEqual(volume_ratio_excluding_t(vols, 3), 2.0)
+
+def pstdev_helper(xs):
+    from statistics import pstdev
+    return pstdev(xs)
 
 if __name__ == "__main__":
     unittest.main()

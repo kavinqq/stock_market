@@ -10,6 +10,10 @@ class TestGating(unittest.TestCase):
     def test_decision_time_is_1830(self):
         dt = decision_time_for("2026-06-26")
         self.assertEqual((dt.hour, dt.minute), (18, 30))
+        # decision_time must be anchored to Asia/Taipei (+08:00), not naive/UTC.
+        from datetime import timedelta
+        self.assertEqual(dt.utcoffset(), timedelta(hours=8))
+        self.assertEqual(dt.tzinfo.key, "Asia/Taipei")
 
     def test_is_available(self):
         dt = decision_time_for("2026-06-26")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 import sqlite3
-from typing import Any, Optional
 
 TW_COLUMNS = [
     "date", "close", "change_points", "turnover", "volume", "trades",

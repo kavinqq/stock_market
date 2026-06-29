@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import math
 import re
 from dataclasses import dataclass
 from statistics import mean

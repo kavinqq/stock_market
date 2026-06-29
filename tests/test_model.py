@@ -1,4 +1,4 @@
-import json, os, tempfile, unittest
+import json, math, os, tempfile, unittest
 from marketlib.model import load_model, predict_proba, proba_to_direction, proba_to_confidence
 
 MODEL = {
@@ -29,8 +29,27 @@ class TestModel(unittest.TestCase):
 
     def test_load_model_roundtrip(self):
         d = tempfile.mkdtemp(); path = os.path.join(d, "m.json")
-        json.dump(MODEL, open(path, "w"))
+        with open(path, "w") as fh:
+            json.dump(MODEL, fh)
         self.assertEqual(load_model(path)["market"], "tw")
+
+    def test_calibration_applied(self):
+        # With a Platt calibrator, predict_proba must return
+        # 1/(1+exp(-(w*z+b))) and differ from the raw sigmoid(z).
+        w, b = 2.0, 0.5
+        cal_model = dict(MODEL, calibration={"method": "platt", "params": {"w": w, "b": b}})
+        feats = {"a": 1.0, "b": 0.0}  # z = 2.0 (coef a=2.0)
+        z = 2.0
+        raw = 1.0 / (1.0 + math.exp(-z))
+        expected = 1.0 / (1.0 + math.exp(-(w * z + b)))
+        got = predict_proba(cal_model, feats)
+        self.assertAlmostEqual(got, expected, places=10)
+        self.assertNotAlmostEqual(got, raw, places=4)
+        # method "none" must return the raw sigmoid (regression guard).
+        none_model = dict(MODEL, calibration={"method": "none", "params": {}})
+        self.assertAlmostEqual(predict_proba(none_model, feats), raw, places=10)
+        # Missing calibration key also returns raw sigmoid.
+        self.assertAlmostEqual(predict_proba(MODEL, feats), raw, places=10)
 
 if __name__ == "__main__":
     unittest.main()

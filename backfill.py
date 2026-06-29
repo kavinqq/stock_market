@@ -2,7 +2,7 @@
 """Offline multi-year history backfill into SQLite (point-in-time aware)."""
 from __future__ import annotations
 import argparse, time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from marketlib import fetchers as F
 from marketlib.store import HistoryStore
 
@@ -66,7 +66,10 @@ def backfill_us(store, start: date, end: date, sleep: float = 0.5) -> None:
             "vix_close": vix.get(d).close if d in vix else None,
             "price_asof_taipei": F.us_price_asof(d) if d in spy else None,
             "vix_asof_taipei": F.vix_asof(d) if d in vix else None,
-            "available_at_taipei": F.us_price_asof(d),
+            "available_at_taipei": _max_asof(
+                F.us_price_asof(d) if d in spy else None,
+                F.vix_asof(d) if d in vix else None,
+            ),
         })
 
 def backfill_finra(store) -> None:
@@ -77,7 +80,7 @@ def backfill_finra(store) -> None:
         # row["month"] 形如 "Jun-25";轉成 "YYYY-MM"
         try:
             dt = datetime.strptime(row["month"], "%b-%y")
-        except ValueError:
+        except (ValueError, KeyError):
             continue
         month = dt.strftime("%Y-%m")
         store.upsert_finra_monthly({

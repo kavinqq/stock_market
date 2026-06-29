@@ -586,8 +586,7 @@ def model_prediction(market: str, model_path: str, rows: list, us_rows: list) ->
     return {"bias": ml_model.proba_to_direction(model, p),
             "probability": round(p, 4),
             "confidence": ml_model.proba_to_confidence(model, p),
-            "model_version": model.get("trained_at", "unknown"),
-            "neutral_threshold_pct": None}
+            "model_version": model.get("trained_at", "unknown")}
 
 
 def _max_asof(*vals: Optional[str]) -> Optional[str]:
@@ -1796,6 +1795,7 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
     db_path = data_dir / "history.db"
+    data_dir.mkdir(parents=True, exist_ok=True)
     store = HistoryStore(str(db_path))
     store.init_schema()
     try:

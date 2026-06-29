@@ -1,5 +1,6 @@
 import json, os, tempfile, unittest
 from daily_market_report import model_prediction
+from marketlib.features import FEATURE_NAMES_TW
 
 MODEL = {
     "market": "tw", "feature_names": ["ret_1d"],
@@ -107,6 +108,28 @@ class TestDaily(unittest.TestCase):
             self.assertIsNotNone(us_row["price_asof_taipei"])
             self.assertEqual(us_row["spy_close"], 550.0)
             store.close()
+
+
+    def test_sparsity_fallback_returns_none(self):
+        """Model with full TW canonical feature list falls back when data is price-only (chip+US features absent)."""
+        sparse_model = {
+            "market": "tw",
+            "feature_names": FEATURE_NAMES_TW,
+            "standardization": {
+                "mean": {n: 0.0 for n in FEATURE_NAMES_TW},
+                "std": {n: 1.0 for n in FEATURE_NAMES_TW},
+            },
+            "imputation_median": {n: 0.0 for n in FEATURE_NAMES_TW},
+            "coefficients": {n: 0.0 for n in FEATURE_NAMES_TW},
+            "intercept": 0.0,
+            "thresholds": {"bull": 0.6, "bear": 0.4},
+        }
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "model_tw.json")
+        json.dump(sparse_model, open(path, "w"))
+        # _rows() is price-only: no chip or US columns -> fewer than half of the
+        # 20 canonical TW features are present -> sparsity guard returns None.
+        self.assertIsNone(model_prediction("tw", path, _rows(), []))
 
 
 if __name__ == "__main__":

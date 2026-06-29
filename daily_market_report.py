@@ -37,7 +37,13 @@ from marketlib.fetchers import (
     fetch_nasdaq_history,
     fetch_vix_history,
     fetch_finra_margin_statistics,
+    twse_asof,
+    us_price_asof,
+    vix_asof,
 )
+from marketlib import model as ml_model
+from marketlib.features import build_feature_row, decision_time_for, FEATURE_NAMES_TW, FEATURE_NAMES_US
+from marketlib.store import HistoryStore
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import mean
@@ -553,6 +559,130 @@ def build_predictions(report: dict[str, Any]) -> dict[str, Any]:
         "taiwan": build_taiwan_prediction(report["taiwan"], report["us"]),
         "us": build_us_prediction(report["us"]),
     }
+
+
+def model_prediction(market: str, model_path: str, rows: list, us_rows: list) -> Optional[dict]:
+    import os
+    if not os.path.exists(model_path) or not rows:
+        return None
+    try:
+        model = ml_model.load_model(model_path)
+    except Exception:
+        return None
+    names = FEATURE_NAMES_TW if market == "tw" else FEATURE_NAMES_US
+    dt = decision_time_for(rows[-1]["date"])
+    feats = build_feature_row(market, rows, len(rows) - 1, us_rows, dt)
+    # Check sparsity against the full canonical feature list for the market.
+    # If the model uses a subset of features, we still fall back when the data
+    # pipeline itself is too sparse (guards against a broken store feed).
+    # Use the larger of the model's own feature list and the canonical list for
+    # the threshold, so minimal test models do not trigger a spurious fallback.
+    model_names = model.get("feature_names", names)
+    check_names = model_names if len(model_names) < len(names) else names
+    present = sum(1 for n in check_names if feats.get(n) is not None)
+    if present < len(check_names) // 2:   # 特徵大量缺 -> 退回規則式
+        return None
+    p = ml_model.predict_proba(model, feats)
+    return {"bias": ml_model.proba_to_direction(model, p),
+            "probability": round(p, 4),
+            "confidence": ml_model.proba_to_confidence(model, p),
+            "model_version": model.get("trained_at", "unknown"),
+            "neutral_threshold_pct": None}
+
+
+def _max_asof(*vals: Optional[str]) -> Optional[str]:
+    present = [v for v in vals if v]
+    return max(present) if present else None
+
+
+def upsert_report_into_store(report: dict[str, Any], store: HistoryStore) -> None:
+    """Map the report's latest-day data into store rows and upsert."""
+    # --- Taiwan tw_daily row ---
+    tw = report.get("taiwan", {})
+    tw_date = tw.get("latest_date")
+    if tw_date:
+        bars = tw.get("bars", [])
+        latest_bar = bars[-1] if bars else {}
+
+        margin = tw.get("margin") or {}
+        financing = margin.get("margin_financing") or {}
+        institutional = tw.get("institutional") or {}
+        summary = tw.get("summary") or {}
+        breadth = summary.get("breadth") or {}
+
+        net = (institutional.get("rows", {}).get("合計") or {}).get("net_ntd")
+        up = (breadth.get("上漲") or {}).get("stocks")
+        down = (breadth.get("下跌") or {}).get("stocks")
+
+        price_asof = twse_asof(tw_date, "price")
+        inst_asof = twse_asof(tw_date, "inst") if net is not None else None
+        margin_asof = twse_asof(tw_date, "margin") if financing else None
+        breadth_asof = twse_asof(tw_date, "breadth") if up is not None else None
+
+        missing = [k for k, v in (("inst", net), ("margin", financing or None),
+                                  ("breadth", up)) if v is None]
+
+        store.upsert_tw_daily({
+            "date": tw_date,
+            "close": latest_bar.get("close"),
+            "turnover": latest_bar.get("turnover"),
+            "volume": latest_bar.get("volume"),
+            "inst_total_net_ntd": net,
+            "margin_balance_ntd": financing.get("today_balance_ntd"),
+            "margin_balance_change_ntd": financing.get("balance_change_ntd"),
+            "adv_count": up,
+            "dec_count": down,
+            "price_asof_taipei": price_asof,
+            "inst_asof_taipei": inst_asof,
+            "margin_asof_taipei": margin_asof,
+            "breadth_asof_taipei": breadth_asof,
+            "available_at_taipei": _max_asof(price_asof, inst_asof, margin_asof, breadth_asof),
+            "missing_fields": ",".join(missing) if missing else None,
+        })
+
+    # --- US us_daily rows ---
+    us = report.get("us", {})
+    us_series = us.get("series", {})
+    vix_bars = (us.get("vix") or {}).get("bars") or []
+    vix_by_date = {b["date"]: b for b in vix_bars}
+
+    # Collect all dates from all US series
+    us_dates: set[str] = set()
+    for asset_data in us_series.values():
+        for bar in asset_data.get("bars", []):
+            if bar.get("date"):
+                us_dates.add(bar["date"])
+
+    # Index bars by date per asset
+    spy_by_date = {b["date"]: b for b in (us_series.get("SPY") or {}).get("bars", [])}
+    qqq_by_date = {b["date"]: b for b in (us_series.get("QQQ") or {}).get("bars", [])}
+    iwm_by_date = {b["date"]: b for b in (us_series.get("IWM") or {}).get("bars", [])}
+    comp_by_date = {b["date"]: b for b in (us_series.get("COMP") or {}).get("bars", [])}
+
+    for d in sorted(us_dates):
+        spy_bar = spy_by_date.get(d)
+        qqq_bar = qqq_by_date.get(d)
+        iwm_bar = iwm_by_date.get(d)
+        comp_bar = comp_by_date.get(d)
+        vix_bar = vix_by_date.get(d)
+
+        price_asof = us_price_asof(d) if spy_bar else None
+        vix_asof_val = vix_asof(d) if vix_bar else None
+
+        store.upsert_us_daily({
+            "date": d,
+            "spy_close": spy_bar.get("close") if spy_bar else None,
+            "spy_volume": spy_bar.get("volume") if spy_bar else None,
+            "qqq_close": qqq_bar.get("close") if qqq_bar else None,
+            "qqq_volume": qqq_bar.get("volume") if qqq_bar else None,
+            "iwm_close": iwm_bar.get("close") if iwm_bar else None,
+            "iwm_volume": iwm_bar.get("volume") if iwm_bar else None,
+            "comp_close": comp_bar.get("close") if comp_bar else None,
+            "vix_close": vix_bar.get("close") if vix_bar else None,
+            "price_asof_taipei": price_asof,
+            "vix_asof_taipei": vix_asof_val,
+            "available_at_taipei": _max_asof(price_asof, vix_asof_val),
+        })
 
 
 def backtest_signal_from_window(bars: list[dict[str, Any]], idx: int, volume_attr: str) -> dict[str, Any]:
@@ -1637,6 +1767,11 @@ def parse_args() -> argparse.Namespace:
         default=str(BASE_DIR / "data"),
         help="JSON output directory.",
     )
+    parser.add_argument(
+        "--model-dir",
+        default=str(BASE_DIR / "models"),
+        help="Directory containing model_tw.json and model_us.json.",
+    )
     return parser.parse_args()
 
 
@@ -1653,13 +1788,59 @@ def main() -> int:
         "taiwan": taiwan,
         "us": us,
     }
+    # Rule-based predictions (primary until model overrides)
     report["predictions"] = build_predictions(report)
-    report["accuracy"] = build_accuracy_report(report, Path(args.data_dir))
+
+    # Model inference: upsert current report data to store, then read store rows
+    # for inference (avoids train/serve skew — model was trained on store-shaped rows).
+    data_dir = Path(args.data_dir)
+    model_dir = Path(args.model_dir)
+    db_path = data_dir / "history.db"
+    store = HistoryStore(str(db_path))
+    store.init_schema()
+    try:
+        upsert_report_into_store(report, store)
+        tw_rows = store.get_tw_rows()
+        us_rows = store.get_us_rows()
+    finally:
+        store.close()
+
+    # Overlay model predictions on top of rule-based predictions where available.
+    for market_key, market_label, model_file, market_rows in (
+        ("taiwan", "tw", "model_tw.json", tw_rows),
+        ("us", "us", "model_us.json", us_rows),
+    ):
+        rule_pred = report["predictions"][market_key]
+        mp = model_prediction(
+            market_label,
+            str(model_dir / model_file),
+            market_rows,
+            us_rows,
+        )
+        if mp is not None:
+            # Overlay: keep all rule dict keys intact, override bias/confidence,
+            # add probability/model_version/prediction_engine/secondary_rule_opinion.
+            # Do NOT clobber neutral_threshold_pct (rule dict's real value is needed
+            # by evaluate_archived_predictions and renderers).
+            report["predictions"][market_key] = dict(rule_pred)
+            report["predictions"][market_key]["bias"] = mp["bias"]
+            report["predictions"][market_key]["confidence"] = mp["confidence"]
+            report["predictions"][market_key]["probability"] = mp["probability"]
+            report["predictions"][market_key]["model_version"] = mp["model_version"]
+            report["predictions"][market_key]["prediction_engine"] = "model"
+            report["predictions"][market_key]["secondary_rule_opinion"] = {
+                "bias": rule_pred["bias"],
+                "score": rule_pred["score"],
+            }
+        else:
+            report["predictions"][market_key]["prediction_engine"] = "rule_fallback"
+
+    report["accuracy"] = build_accuracy_report(report, data_dir)
 
     markdown_path, html_path, json_path = write_outputs(
         report,
         Path(args.report_dir),
-        Path(args.data_dir),
+        data_dir,
     )
     print(f"Wrote {markdown_path}")
     print(f"Wrote {html_path}")

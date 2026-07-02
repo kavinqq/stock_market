@@ -589,3 +589,521 @@ def revenue_metrics(rev: Optional[dict[str, Any]]) -> dict[str, Any]:
         "mom_pct": rev.get("mom_pct"),
         "cum_yoy_pct": rev.get("cum_yoy_pct"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Scorecard — per-facet scoring, lean combination, 2330 scorecard builder
+# ---------------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# Module-level constants (tunable)
+# ------------------------------------------------------------------
+
+# Technical facet thresholds
+TECH_RSI_OVERBOUGHT = 80.0   # RSI above this → deduct
+TECH_RSI_OVERSOLD = 20.0     # RSI below this → add (reversal)
+
+# Revenue facet thresholds (YoY %)
+REV_BULL_THRESHOLD = 20.0    # ≥ +20 % → strong positive signal
+REV_BEAR_THRESHOLD = -10.0   # ≤ −10 % → negative signal
+
+# Lean bias thresholds
+LEAN_BULL_THRESHOLD = 0.25   # score ≥ +0.25 → 偏多
+LEAN_BEAR_THRESHOLD = -0.25  # score ≤ −0.25 → 偏空
+LEAN_HIGH_CONF = 0.5         # |score| > 0.5 → 高
+LEAN_MED_CONF = 0.25         # |score| > 0.25 → 中
+
+# Weights for short-term lean (日線+量能+籌碼為主)
+SHORT_WEIGHTS: dict[str, float] = {
+    "technical": 0.35,
+    "volume": 0.20,
+    "chip": 0.25,
+    "valuation": 0.05,
+    "revenue": 0.05,
+    "peer": 0.05,
+    "market": 0.05,
+}
+
+# Weights for medium-term lean (週線+基本面+同業/大盤)
+MEDIUM_WEIGHTS: dict[str, float] = {
+    "technical": 0.20,
+    "volume": 0.10,
+    "chip": 0.10,
+    "valuation": 0.20,
+    "revenue": 0.20,
+    "peer": 0.10,
+    "market": 0.10,
+}
+
+_MISSING_FACET = {"score": None, "reason": "資料不足", "metrics": {}}
+
+
+def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    """Clamp v to [lo, hi]."""
+    return max(lo, min(hi, v))
+
+
+# ------------------------------------------------------------------
+# Facet scoring functions
+# ------------------------------------------------------------------
+
+
+def technical_facet(metrics: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Score technical posture from technical_metrics() output.
+
+    Score direction (v1):
+    - +: 站上 ma20, 多頭排列 (ma5>ma20>ma60), 日 MACD 黃金交叉, 週線多頭
+    - −: 跌破 ma20, 死亡交叉
+    - RSI>80 減分; RSI<20 加分(反轉)
+    Returns {"metrics":dict, "score":Optional[float], "reason":str}.
+    """
+    if not metrics:
+        return dict(_MISSING_FACET)
+
+    close = metrics.get("close")
+    ma5 = metrics.get("ma5")
+    ma20 = metrics.get("ma20")
+    ma60 = metrics.get("ma60")
+    rsi_val = metrics.get("rsi")
+    macd_daily = metrics.get("macd_daily")
+    macd_weekly = metrics.get("macd_weekly")
+
+    if close is None or ma20 is None:
+        return dict(_MISSING_FACET)
+
+    score = 0.0
+    reasons: list[str] = []
+
+    # MA20 position (+0.3 / −0.3)
+    if close > ma20:
+        score += 0.3
+        reasons.append("站上ma20")
+    else:
+        score -= 0.3
+        reasons.append("跌破ma20")
+
+    # 多頭排列 ma5>ma20>ma60 (+0.2)
+    if ma5 is not None and ma60 is not None:
+        if ma5 > ma20 > ma60:
+            score += 0.2
+            reasons.append("多頭排列")
+        elif ma5 < ma20 < ma60:
+            score -= 0.2
+            reasons.append("空頭排列")
+
+    # Daily MACD cross (+0.25 / −0.25)
+    if macd_daily is not None:
+        cross = macd_daily.get("cross")
+        if cross == "golden":
+            score += 0.25
+            reasons.append("日MACD黃金交叉")
+        elif cross == "dead":
+            score -= 0.25
+            reasons.append("日MACD死亡交叉")
+        # No cross — check histogram sign for mild signal
+        elif macd_daily.get("hist") is not None:
+            if macd_daily["hist"] > 0:
+                score += 0.1
+            else:
+                score -= 0.1
+
+    # Weekly MACD (+0.15 / −0.15)
+    if macd_weekly is not None:
+        cross_w = macd_weekly.get("cross")
+        if cross_w == "golden":
+            score += 0.15
+            reasons.append("週MACD黃金交叉")
+        elif cross_w == "dead":
+            score -= 0.15
+            reasons.append("週MACD死亡交叉")
+        elif macd_weekly.get("hist") is not None:
+            if macd_weekly["hist"] > 0:
+                score += 0.05
+            else:
+                score -= 0.05
+
+    # RSI extremes
+    if rsi_val is not None:
+        if rsi_val > TECH_RSI_OVERBOUGHT:
+            score -= 0.15
+            reasons.append(f"RSI超買({rsi_val:.0f})")
+        elif rsi_val < TECH_RSI_OVERSOLD:
+            score += 0.15
+            reasons.append(f"RSI超賣({rsi_val:.0f})")
+
+    score = _clamp(score)
+    return {
+        "metrics": metrics,
+        "score": score,
+        "reason": "，".join(reasons) if reasons else "無明顯信號",
+    }
+
+
+def volume_facet(metrics: Optional[dict[str, Any]], ret5: Optional[float] = None) -> dict[str, Any]:
+    """Score volume behaviour.
+
+    放量漲+ / 放量跌− / 量縮追價不足 slight −.
+    metrics: must contain volume_ratio_20d; ret5 is 5-day return.
+    """
+    if not metrics:
+        return dict(_MISSING_FACET)
+
+    vol_ratio = metrics.get("volume_ratio_20d")
+    if vol_ratio is None:
+        return dict(_MISSING_FACET)
+
+    ret = ret5 if ret5 is not None else metrics.get("ret5")
+
+    score = 0.0
+    reasons: list[str] = []
+
+    high_vol = vol_ratio > 1.5   # 放量
+    low_vol = vol_ratio < 0.7    # 縮量
+
+    if ret is not None:
+        if high_vol and ret > 0:
+            score += 0.6
+            reasons.append(f"放量上漲(量比{vol_ratio:.1f}x)")
+        elif high_vol and ret < 0:
+            score -= 0.6
+            reasons.append(f"放量下跌(量比{vol_ratio:.1f}x)")
+        elif low_vol and ret > 0:
+            score -= 0.2
+            reasons.append("縮量追價不足")
+        else:
+            score = 0.0
+    else:
+        # No return info — just use volume ratio directionally
+        if high_vol:
+            score = 0.0  # unknown direction
+        elif low_vol:
+            score = -0.1
+            reasons.append("縮量")
+
+    score = _clamp(score)
+    return {
+        "metrics": {"volume_ratio_20d": vol_ratio, "ret5": ret},
+        "score": score,
+        "reason": "，".join(reasons) if reasons else "量能中性",
+    }
+
+
+def valuation_facet(metrics: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Score valuation cheapness.
+
+    pe_pct: percentile rank of current PE vs history (0=cheapest, 1=most expensive).
+    Score = (0.5 - pe_pct) * 2, clipped to [-1, 1].
+    Cheaper (low pe_pct) → more bullish (positive score).
+    """
+    if not metrics:
+        return dict(_MISSING_FACET)
+
+    pe_pct = metrics.get("pe_pct")
+    pb_pct = metrics.get("pb_pct")
+
+    if pe_pct is None and pb_pct is None:
+        return dict(_MISSING_FACET)
+
+    scores = []
+    reasons: list[str] = []
+
+    if pe_pct is not None:
+        pe_score = (0.5 - pe_pct) * 2
+        scores.append(pe_score)
+        if pe_pct < 0.3:
+            reasons.append(f"估值便宜(PE百分位{pe_pct:.0%})")
+        elif pe_pct > 0.7:
+            reasons.append(f"估值偏貴(PE百分位{pe_pct:.0%})")
+
+    if pb_pct is not None:
+        pb_score = (0.5 - pb_pct) * 2
+        scores.append(pb_score)
+
+    score = _clamp(mean(scores))
+    return {
+        "metrics": metrics,
+        "score": score,
+        "reason": "，".join(reasons) if reasons else "估值中性",
+    }
+
+
+def revenue_facet(metrics: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Score revenue momentum.
+
+    yoy_pct >= REV_BULL_THRESHOLD (+20%) → +1.0 (linear scaling).
+    yoy_pct <= REV_BEAR_THRESHOLD (-10%) → -1.0.
+    Linear interpolation between those two anchors.
+    """
+    if not metrics:
+        return dict(_MISSING_FACET)
+
+    yoy = metrics.get("yoy_pct")
+    if yoy is None:
+        return dict(_MISSING_FACET)
+
+    # Linear map: [-10, +20] → [-1, +1]
+    span = REV_BULL_THRESHOLD - REV_BEAR_THRESHOLD  # 30
+    score = _clamp((yoy - REV_BEAR_THRESHOLD) / span * 2 - 1)
+
+    if yoy >= REV_BULL_THRESHOLD:
+        reason = f"營收YoY強勁+{yoy:.1f}%"
+    elif yoy <= REV_BEAR_THRESHOLD:
+        reason = f"營收YoY衰退{yoy:.1f}%"
+    else:
+        reason = f"營收YoY {yoy:.1f}%"
+
+    return {
+        "metrics": metrics,
+        "score": score,
+        "reason": reason,
+    }
+
+
+def chip_facet(t86_recent: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
+    """Score institutional chip posture.
+
+    t86_recent: list of up to 5 daily T86 dicts (each has inst_total_net_lots).
+    法人近5日淨買超(張)為正且占比高 → +; 連賣 → −.
+    """
+    if not t86_recent:
+        return dict(_MISSING_FACET)
+
+    lots = []
+    for day in t86_recent:
+        if day and day.get("inst_total_net_lots") is not None:
+            lots.append(day["inst_total_net_lots"])
+
+    if not lots:
+        return dict(_MISSING_FACET)
+
+    total = sum(lots)
+    days_positive = sum(1 for l in lots if l > 0)
+    days_n = len(lots)
+
+    # Score: net lots sign × fraction of positive days, normalised
+    # Rough scale: 5000 lots over 5 days = max signal
+    norm = min(abs(total) / 5000.0, 1.0)
+    direction = 1.0 if total > 0 else (-1.0 if total < 0 else 0.0)
+    pos_ratio = days_positive / days_n
+    # Blend magnitude and consistency
+    score = _clamp(direction * (0.5 * norm + 0.5 * abs(2 * pos_ratio - 1)) * direction)
+
+    if total > 0:
+        reason = f"法人近{days_n}日淨買超{total:.0f}張"
+    elif total < 0:
+        reason = f"法人近{days_n}日淨賣超{abs(total):.0f}張"
+    else:
+        reason = "法人中性"
+
+    return {
+        "metrics": {"inst_net_lots_total": total, "days": days_n, "days_positive": days_positive},
+        "score": score,
+        "reason": reason,
+    }
+
+
+def peer_facet(peer: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Score peer/sector environment.
+
+    peer: dict with keys smh_ret20 (SMH 20-day return), adr_ret (ADR daily return).
+    SMH 20日多頭(ret>0) + ADR 收紅(ret>0) → +.
+    """
+    if not peer:
+        return dict(_MISSING_FACET)
+
+    smh_ret20 = peer.get("smh_ret20")
+    adr_ret = peer.get("adr_ret")
+
+    if smh_ret20 is None and adr_ret is None:
+        return dict(_MISSING_FACET)
+
+    scores = []
+    reasons: list[str] = []
+
+    if smh_ret20 is not None:
+        # SMH 20d return: normalise ±20% = ±1
+        s = _clamp(smh_ret20 / 0.20)
+        scores.append(s)
+        if smh_ret20 > 0:
+            reasons.append(f"SMH多頭({smh_ret20:.1%})")
+        else:
+            reasons.append(f"SMH空頭({smh_ret20:.1%})")
+
+    if adr_ret is not None:
+        s = _clamp(adr_ret / 0.05)  # ±5% = ±1
+        scores.append(s)
+        if adr_ret > 0:
+            reasons.append(f"ADR收紅({adr_ret:.1%})")
+        else:
+            reasons.append(f"ADR收黑({adr_ret:.1%})")
+
+    score = _clamp(mean(scores))
+    return {
+        "metrics": peer,
+        "score": score,
+        "reason": "，".join(reasons) if reasons else "同業中性",
+    }
+
+
+def market_facet(market: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Score overall market environment.
+
+    market: dict with keys taiex_ret20 (20-day return), vix (current VIX level).
+    加權多頭(ret>0) + VIX 低(<20) → +.
+    """
+    if not market:
+        return dict(_MISSING_FACET)
+
+    taiex_ret20 = market.get("taiex_ret20")
+    vix = market.get("vix")
+
+    if taiex_ret20 is None and vix is None:
+        return dict(_MISSING_FACET)
+
+    scores = []
+    reasons: list[str] = []
+
+    if taiex_ret20 is not None:
+        s = _clamp(taiex_ret20 / 0.15)  # ±15% = ±1
+        scores.append(s)
+        if taiex_ret20 > 0:
+            reasons.append(f"加權多頭({taiex_ret20:.1%})")
+        else:
+            reasons.append(f"加權空頭({taiex_ret20:.1%})")
+
+    if vix is not None:
+        # VIX: low (<15) = +0.5, medium (15-25) = 0, high (>30) = -0.5
+        if vix < 15:
+            vix_score = 0.5
+            reasons.append(f"VIX低({vix:.0f})")
+        elif vix > 30:
+            vix_score = -0.5
+            reasons.append(f"VIX高({vix:.0f})")
+        else:
+            vix_score = _clamp((20 - vix) / 20)
+        scores.append(vix_score)
+
+    score = _clamp(mean(scores)) if scores else 0.0
+    return {
+        "metrics": market,
+        "score": score,
+        "reason": "，".join(reasons) if reasons else "大盤中性",
+    }
+
+
+# ------------------------------------------------------------------
+# Lean combination
+# ------------------------------------------------------------------
+
+
+def combine_lean(
+    facet_scores: dict[str, Optional[float]],
+    weights: dict[str, float],
+) -> dict[str, Any]:
+    """Combine per-facet scores into a directional lean.
+
+    - Ignores facets with score=None.
+    - Re-normalises weights over the non-None facets.
+    - Weighted average → score in [-1, 1].
+    - Bias: score >= +0.25 → 偏多; <= -0.25 → 偏空; else 中性.
+    - Confidence by |score|: >0.5 高 / >0.25 中 / else 低.
+    - If all facets are None: score=0, 中性, 低.
+    Returns {"bias", "confidence", "score", "reasons"}.
+    """
+    active = {
+        k: v for k, v in facet_scores.items()
+        if v is not None and k in weights
+    }
+
+    if not active:
+        return {"bias": "中性", "confidence": "低", "score": 0.0, "reasons": []}
+
+    total_weight = sum(weights[k] for k in active)
+    if total_weight == 0:
+        return {"bias": "中性", "confidence": "低", "score": 0.0, "reasons": []}
+
+    score = sum(active[k] * weights[k] for k in active) / total_weight
+
+    if score >= LEAN_BULL_THRESHOLD:
+        bias = "偏多"
+    elif score <= LEAN_BEAR_THRESHOLD:
+        bias = "偏空"
+    else:
+        bias = "中性"
+
+    abs_score = abs(score)
+    if abs_score > LEAN_HIGH_CONF:
+        confidence = "高"
+    elif abs_score > LEAN_MED_CONF:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    reasons = list(active.keys())
+
+    return {
+        "bias": bias,
+        "confidence": confidence,
+        "score": score,
+        "reasons": reasons,
+    }
+
+
+# ------------------------------------------------------------------
+# 2330 scorecard builder
+# ------------------------------------------------------------------
+
+
+def build_2330_scorecard(
+    daily_bars: list[MarketBar],
+    weekly_context: Optional[dict[str, Any]],
+    valuation: Optional[dict[str, Any]],
+    revenue: Optional[dict[str, Any]],
+    t86_recent: Optional[list[dict[str, Any]]],
+    peer: Optional[dict[str, Any]],
+    market: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a multi-facet scorecard for 2330 (TSMC) with short and medium leans.
+
+    Args:
+        daily_bars: list of recent daily MarketBar (at least 60 recommended).
+        weekly_context: optional dict passed through to peer facet.
+        valuation: output of valuation_metrics() — dict with pe_pct, pb_pct, etc.
+        revenue: output of revenue_metrics() — dict with yoy_pct, etc.
+        t86_recent: list of up to 5 daily T86 dicts for chip facet.
+        peer: dict with smh_ret20, adr_ret for peer facet.
+        market: dict with taiex_ret20, vix for market facet.
+
+    Returns:
+        {
+            "facets": {name: facet_result, ...},
+            "short_lean": combine_lean result,
+            "medium_lean": combine_lean result,
+            "missing": [list of facet names with score=None],
+        }
+    """
+    tech_m = technical_metrics(daily_bars) if daily_bars else None
+
+    facets: dict[str, dict[str, Any]] = {
+        "technical": technical_facet(tech_m),
+        "volume": volume_facet(tech_m),
+        "valuation": valuation_facet(valuation),
+        "revenue": revenue_facet(revenue),
+        "chip": chip_facet(t86_recent),
+        "peer": peer_facet(peer),
+        "market": market_facet(market),
+    }
+
+    scores: dict[str, Optional[float]] = {name: f["score"] for name, f in facets.items()}
+
+    short_lean = combine_lean(scores, SHORT_WEIGHTS)
+    medium_lean = combine_lean(scores, MEDIUM_WEIGHTS)
+
+    missing = [name for name, f in facets.items() if f["score"] is None]
+
+    return {
+        "facets": facets,
+        "short_lean": short_lean,
+        "medium_lean": medium_lean,
+        "missing": missing,
+    }

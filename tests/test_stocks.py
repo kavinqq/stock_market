@@ -201,5 +201,28 @@ class TestStockFundamental(unittest.TestCase):
         self.assertAlmostEqual(out["pe_pct"], 0.4)  # 2 of 5 <=15
 
 
+class TestScorecard(unittest.TestCase):
+    def test_combine_lean_bias(self):
+        from marketlib.stocks import combine_lean
+        out = combine_lean({"a": 0.8, "b": 0.6, "c": None}, {"a": 1.0, "b": 1.0, "c": 1.0})
+        self.assertEqual(out["bias"], "偏多")
+        self.assertEqual(out["confidence"], "高")
+        self.assertNotIn("c", str(out["reasons"]))  # None facet ignored
+
+    def test_combine_lean_neutral_and_missing_renorm(self):
+        from marketlib.stocks import combine_lean
+        out = combine_lean({"a": 0.1, "b": -0.1}, {"a": 1.0, "b": 1.0})
+        self.assertEqual(out["bias"], "中性")
+
+    def test_valuation_facet_cheap_is_bullish(self):
+        from marketlib.stocks import valuation_facet
+        f = valuation_facet({"pe": 15.0, "pb": 3.0, "dividend_yield": 2.0, "pe_pct": 0.1, "pb_pct": 0.1})
+        self.assertGreater(f["score"], 0)
+
+    def test_facet_missing_returns_none(self):
+        from marketlib.stocks import valuation_facet
+        self.assertIsNone(valuation_facet(None)["score"])
+
+
 if __name__ == "__main__":
     unittest.main()

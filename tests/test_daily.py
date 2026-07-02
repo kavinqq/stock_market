@@ -134,5 +134,39 @@ class TestDaily(unittest.TestCase):
         self.assertIsNone(model_prediction("tw", path, _rows(), []))
 
 
+def _bars():
+    from marketlib.core import MarketBar
+    from datetime import date, timedelta
+    base = date(2026, 1, 2)
+    # Generate 80 consecutive calendar days (including weekends, which resample_weekly handles)
+    return [
+        MarketBar(
+            date=(base + timedelta(days=m)).isoformat(),
+            close=1000 + (m % 10),
+            high=1010.0,
+            low=990.0,
+            volume=3e7,
+        )
+        for m in range(80)
+    ]
+
+
+class TestStock2330(unittest.TestCase):
+    def test_assemble_complete_with_missing_revenue(self):
+        from daily_market_report import assemble_2330
+        r = assemble_2330(
+            _bars(),
+            {"pe": 20.0, "pb": 5.0, "dividend_yield": 1.8, "pe_pct": 0.3, "pb_pct": 0.3},
+            None,
+            {"inst_total_net_lots": 3000.0},
+            {"smh_20d": 0.05, "adr_day": 0.01},
+            {"index_trend": "多頭", "vix": 16.0},
+        )
+        self.assertIn("short_lean", r)
+        self.assertIn("medium_lean", r)
+        self.assertIsNone(r["facets"]["revenue"]["score"])   # missing source
+        self.assertIn(r["short_lean"]["bias"], ("偏多", "中性", "偏空"))
+
+
 if __name__ == "__main__":
     unittest.main()

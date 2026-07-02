@@ -44,6 +44,7 @@ from marketlib.fetchers import (
 from marketlib import model as ml_model
 from marketlib.features import build_feature_row, decision_time_for, FEATURE_NAMES_TW, FEATURE_NAMES_US
 from marketlib.store import HistoryStore
+from marketlib import stocks as _stocks
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import mean
@@ -984,6 +985,95 @@ def fmt_neutral_threshold(value: Optional[float]) -> str:
     return fmt_pct(value, decimals=2, signed=False)
 
 
+def _facet_tone(score: Optional[float]) -> str:
+    if score is None:
+        return "muted"
+    if score >= 0.25:
+        return "good"
+    if score <= -0.25:
+        return "bad"
+    return "warn"
+
+
+def _lean_tone(bias: str) -> str:
+    if bias == "偏多":
+        return "good"
+    if bias == "偏空":
+        return "bad"
+    return "warn"
+
+
+def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
+    """Render the 台積電 2330 HTML section."""
+    if not stock or "error" in stock:
+        err_msg = (stock or {}).get("error", "資料未取得")
+        return (
+            '<section id="stock2330" class="page">'
+            '<div class="hero"><h1>台積電 2330</h1></div>'
+            f'<div class="panel"><h2>資料不足</h2><p class="subtle">{esc(err_msg)}</p></div>'
+            '</section>'
+        )
+
+    facets = stock.get("facets") or {}
+    short_lean = stock.get("short_lean") or {}
+    medium_lean = stock.get("medium_lean") or {}
+    missing = stock.get("missing") or []
+    levels = stock.get("observe_levels") or {}
+
+    # Facet cards
+    facet_names = {
+        "technical": "技術",
+        "volume": "量能",
+        "chip": "籌碼",
+        "valuation": "估值",
+        "revenue": "營收",
+        "peer": "同業",
+        "market": "大盤",
+    }
+    facet_cards_html = ""
+    for key, label in facet_names.items():
+        f = facets.get(key, {})
+        score = f.get("score")
+        reason = f.get("reason", "資料不足")
+        score_str = f"{score:.2f}" if score is not None else "N/A"
+        tone = _facet_tone(score)
+        facet_cards_html += metric_card(label, score_str, reason, tone)
+
+    # Lean cards
+    lean_cards_html = (
+        metric_card("短線方向", short_lean.get("bias", "N/A"),
+                    f"信心 {short_lean.get('confidence', 'N/A')} / 分數 {fmt_num(short_lean.get('score'), 2)}",
+                    _lean_tone(short_lean.get("bias", "")))
+        + metric_card("中線方向", medium_lean.get("bias", "N/A"),
+                      f"信心 {medium_lean.get('confidence', 'N/A')} / 分數 {fmt_num(medium_lean.get('score'), 2)}",
+                      _lean_tone(medium_lean.get("bias", "")))
+    )
+
+    missing_note = f"缺少資料：{', '.join(missing)}" if missing else "各構面資料完整"
+
+    return (
+        '<section id="stock2330" class="page">'
+        '<div class="hero">'
+        '<h1>台積電 2330</h1>'
+        '<div class="subtle">多構面評分：技術/量能/籌碼/估值/營收/同業/大盤，短線+中線方向。</div>'
+        '</div>'
+        '<h3>構面評分</h3>'
+        f'<div class="grid">{facet_cards_html}</div>'
+        '<h3>方向研判</h3>'
+        f'<div class="grid">{lean_cards_html}</div>'
+        '<div class="panel">'
+        '<h2>觀察價位</h2>'
+        + bullet_list([
+            f"現價 {fmt_num(levels.get('close'), 2)}",
+            f"20日區間支撐 {fmt_num(levels.get('support_20d'), 2)}，壓力 {fmt_num(levels.get('resistance_20d'), 2)}",
+            f"MA5 {fmt_num(levels.get('ma5'), 2)}，MA20 {fmt_num(levels.get('ma20'), 2)}，MA60 {fmt_num(levels.get('ma60'), 2)}",
+        ]) +
+        '</div>'
+        f'<p class="subtle">{esc(missing_note)}</p>'
+        '</section>'
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     generated = report["generated_at"]
     tw = report["taiwan"]
@@ -1134,6 +1224,47 @@ def render_markdown(report: dict[str, Any]) -> str:
             "註：這是規則式市場分析，不是投資建議。",
         ]
     )
+
+    # --- 台積電 2330 section ---
+    stock = report.get("stock_2330")
+    lines.extend(["", "## 台積電 2330", ""])
+    if not stock or "error" in stock:
+        err_msg = (stock or {}).get("error", "資料未取得")
+        lines.append(f"- 資料不足：{err_msg}")
+    else:
+        facets = stock.get("facets") or {}
+        short_lean = stock.get("short_lean") or {}
+        medium_lean = stock.get("medium_lean") or {}
+        missing = stock.get("missing") or []
+        levels = stock.get("observe_levels") or {}
+
+        lines.append(
+            f"- 短線：{short_lean.get('bias', 'N/A')}，信心 {short_lean.get('confidence', 'N/A')}，"
+            f"分數 {fmt_num(short_lean.get('score'), 2)}"
+        )
+        lines.append(
+            f"- 中線：{medium_lean.get('bias', 'N/A')}，信心 {medium_lean.get('confidence', 'N/A')}，"
+            f"分數 {fmt_num(medium_lean.get('score'), 2)}"
+        )
+        facet_names = {"technical": "技術", "volume": "量能", "chip": "籌碼",
+                       "valuation": "估值", "revenue": "營收", "peer": "同業", "market": "大盤"}
+        for key, label in facet_names.items():
+            f = facets.get(key, {})
+            score = f.get("score")
+            reason = f.get("reason", "資料不足")
+            score_str = f"{score:.2f}" if score is not None else "N/A"
+            lines.append(f"- {label}：{score_str}，{reason}")
+        lines.extend([
+            "",
+            "### 觀察價位",
+            "",
+            f"- 現價 {fmt_num(levels.get('close'), 2)}",
+            f"- 20日區間支撐 {fmt_num(levels.get('support_20d'), 2)}，壓力 {fmt_num(levels.get('resistance_20d'), 2)}",
+            f"- MA5 {fmt_num(levels.get('ma5'), 2)}，MA20 {fmt_num(levels.get('ma20'), 2)}，MA60 {fmt_num(levels.get('ma60'), 2)}",
+        ])
+        if missing:
+            lines.append(f"- 缺少資料：{', '.join(missing)}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -1241,6 +1372,7 @@ def render_html(report: dict[str, Any]) -> str:
     us_acc = accuracy.get("us", {})
     archived_acc = accuracy.get("archived_predictions", {})
     improvement_log = accuracy.get("improvement_log", [])
+    stock_2330_section = html_stock_2330_section(report.get("stock_2330"))
 
     sectors = (tw.get("sectors") or {}).get("rows") or {}
     sector_rows = "".join(
@@ -1522,6 +1654,7 @@ def render_html(report: dict[str, Any]) -> str:
         <a href="#taiwan">台股</a>
         <a href="#us">美股</a>
         <a href="#cross">回推</a>
+        <a href="#stock2330">台積電 2330</a>
         <a href="#sources">資料源</a>
       </nav>
       <div class="meta">
@@ -1692,6 +1825,7 @@ def render_html(report: dict[str, Any]) -> str:
           <p class="subtle">註：這是規則式市場分析，不是投資建議。</p>
         </div>
       </section>
+      {stock_2330_section}
     </main>
   </div>
   <script>
@@ -1735,6 +1869,230 @@ def write_outputs(report: dict[str, Any], report_dir: Path, data_dir: Path) -> t
     update_evaluation_history(report, data_dir)
 
     return markdown_path, html_path, json_path
+
+
+# ---------------------------------------------------------------------------
+# 台積電 2330 multi-facet scorecard integration
+# ---------------------------------------------------------------------------
+
+# Map trend_label strings to a synthetic 20-day return proxy used by market_facet.
+_TREND_TO_RET20: dict[str, float] = {
+    "多頭": 0.05,
+    "偏多": 0.03,
+    "中性": 0.0,
+    "偏空": -0.03,
+    "空頭": -0.05,
+}
+
+
+def assemble_2330(
+    daily_bars: list,
+    valuation: Optional[dict[str, Any]],
+    revenue: Optional[dict[str, Any]],
+    t86: Optional[dict[str, Any]],
+    peer: Optional[dict[str, Any]],
+    market: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pure assembly: compute metrics → facets → scorecard for 2330.
+
+    Args:
+        daily_bars: list of MarketBar (at least 60 recommended).
+        valuation: dict with pe, pb, dividend_yield, pe_pct, pb_pct (or None).
+        revenue: dict with yoy_pct, mom_pct, cum_yoy_pct (or None → revenue facet score None).
+        t86: single T86 dict with inst_total_net_lots (or None).
+        peer: dict with smh_20d (SMH 20d return), adr_day (ADR day change).
+        market: dict with index_trend (str label) and vix (float).
+
+    Returns:
+        scorecard dict with keys: facets, short_lean, medium_lean, missing,
+        plus observe_levels with support/resistance/ma20/ma60.
+    """
+    # Map incoming peer keys to what peer_facet expects
+    peer_mapped: Optional[dict[str, Any]] = None
+    if peer is not None:
+        peer_mapped = {
+            "smh_ret20": peer.get("smh_20d"),
+            "adr_ret": peer.get("adr_day"),
+        }
+
+    # Map market: translate trend label to synthetic taiex_ret20
+    market_mapped: Optional[dict[str, Any]] = None
+    if market is not None:
+        trend_label = market.get("index_trend", "中性")
+        taiex_ret20 = _TREND_TO_RET20.get(trend_label, 0.0)
+        market_mapped = {
+            "taiex_ret20": taiex_ret20,
+            "vix": market.get("vix"),
+        }
+
+    # Wrap single T86 dict into a list for chip_facet
+    t86_list: Optional[list[dict[str, Any]]] = [t86] if t86 is not None else None
+
+    # revenue_metrics returns {"yoy_pct": None, ...} when None → revenue_facet → score None
+    rev_metrics = _stocks.revenue_metrics(revenue)
+
+    scorecard = _stocks.build_2330_scorecard(
+        daily_bars=daily_bars,
+        weekly_context=None,
+        valuation=valuation,
+        revenue=rev_metrics,
+        t86_recent=t86_list,
+        peer=peer_mapped,
+        market=market_mapped,
+    )
+
+    # Attach observe levels from the daily bars
+    tech_m = _stocks.technical_metrics(daily_bars) if daily_bars else {}
+    closes = [b.close for b in daily_bars] if daily_bars else []
+    recent20 = closes[-20:] if len(closes) >= 20 else closes
+    scorecard["observe_levels"] = {
+        "support_20d": min(recent20) if recent20 else None,
+        "resistance_20d": max(recent20) if recent20 else None,
+        "ma20": tech_m.get("ma20"),
+        "ma60": tech_m.get("ma60"),
+        "ma5": tech_m.get("ma5"),
+        "close": tech_m.get("close"),
+    }
+
+    return scorecard
+
+
+def build_stock_2330(
+    report_us: dict[str, Any],
+    report_tw: dict[str, Any],
+    end: date,
+    store: "HistoryStore",
+) -> dict[str, Any]:
+    """Fetch 2330 data, upsert to store, delegate to assemble_2330.
+
+    Each data source is independently wrapped; failure → that facet input None.
+    Returns scorecard dict or {"error": ...} if core price fetch fails.
+    """
+    from marketlib.fetchers import fetch_nasdaq_history
+
+    end_iso = end.isoformat()
+
+    # --- Core: 2330 daily price history (required) ---
+    try:
+        daily_bars = _stocks.fetch_stock_history("2330", end, lookback_months=5)
+        if not daily_bars:
+            raise ValueError("empty 2330 price history")
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"2330 price fetch failed: {exc}"}
+
+    # --- T86 institutional chip (best-effort) ---
+    t86: Optional[dict[str, Any]] = None
+    try:
+        t86 = _stocks.fetch_t86_for_stock("2330", end_iso)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Valuation PE/PB (best-effort) ---
+    valuation_raw: Optional[dict[str, Any]] = None
+    try:
+        valuation_raw = _stocks.fetch_valuation_for_stock("2330", end_iso)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Monthly revenue (best-effort) ---
+    revenue_raw: Optional[dict[str, Any]] = None
+    try:
+        revenue_raw = _stocks.fetch_monthly_revenue("2330")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Upsert fetched data into store ---
+    try:
+        # Upsert daily bars
+        for bar in daily_bars:
+            row: dict[str, Any] = {
+                "stock_no": "2330",
+                "date": bar.date,
+                "close": bar.close,
+                "high": bar.high,
+                "low": bar.low,
+                "open": bar.open,
+                "volume": bar.volume,
+            }
+            if t86 is not None and bar.date == daily_bars[-1].date:
+                row.update({
+                    "foreign_net_lots": t86.get("foreign_net_lots"),
+                    "trust_net_lots": t86.get("trust_net_lots"),
+                    "dealer_net_lots": t86.get("dealer_net_lots"),
+                    "inst_total_net_lots": t86.get("inst_total_net_lots"),
+                })
+            store.upsert_stock_daily(row)
+
+        # Upsert valuation
+        if valuation_raw is not None:
+            store.upsert_stock_valuation({
+                "stock_no": "2330",
+                "date": end_iso,
+                "pe": valuation_raw.get("pe"),
+                "pb": valuation_raw.get("pb"),
+                "dividend_yield": valuation_raw.get("dividend_yield"),
+            })
+
+        # Upsert revenue
+        if revenue_raw is not None:
+            store.upsert_stock_monthly_revenue({
+                "stock_no": "2330",
+                "month": revenue_raw.get("month", end_iso[:7]),
+                "revenue_thousand": revenue_raw.get("revenue_thousand"),
+                "yoy_pct": revenue_raw.get("yoy_pct"),
+                "mom_pct": revenue_raw.get("mom_pct"),
+                "cum_yoy_pct": revenue_raw.get("cum_yoy_pct"),
+            })
+    except Exception:  # noqa: BLE001
+        pass  # store upsert failure is non-fatal
+
+    # --- Build PE/PB history from store for percentile calculation ---
+    pe_history: list[float] = []
+    pb_history: list[float] = []
+    try:
+        val_rows = store.get_stock_valuation("2330")
+        pe_history = [r["pe"] for r in val_rows if r.get("pe") is not None]
+        pb_history = [r["pb"] for r in val_rows if r.get("pb") is not None]
+    except Exception:  # noqa: BLE001
+        pass
+
+    valuation = _stocks.valuation_metrics(valuation_raw, pe_history, pb_history)
+
+    # --- Peer: fetch SMH and TSM ADR (best-effort) ---
+    peer: Optional[dict[str, Any]] = None
+    try:
+        start_peer = end - timedelta(days=40)
+        smh_bars = fetch_nasdaq_history("SMH", "etf", start_peer, end)
+        smh_closes = [b.close for b in smh_bars if b.close]
+        smh_ret20: Optional[float] = None
+        if len(smh_closes) >= 21:
+            smh_ret20 = smh_closes[-1] / smh_closes[-21] - 1
+        elif len(smh_closes) >= 2:
+            smh_ret20 = smh_closes[-1] / smh_closes[0] - 1
+
+        tsm_bars = fetch_nasdaq_history("TSM", "stocks", start_peer, end)
+        adr_day: Optional[float] = None
+        if len(tsm_bars) >= 2:
+            adr_day = tsm_bars[-1].close / tsm_bars[-2].close - 1
+
+        if smh_ret20 is not None or adr_day is not None:
+            peer = {"smh_20d": smh_ret20, "adr_day": adr_day}
+    except Exception:  # noqa: BLE001
+        pass  # peer facet will be missing
+
+    # --- Market: reuse existing report data ---
+    tw_ind_dict = report_tw.get("indicators") or {}
+    vix_data = (report_us.get("vix") or {}).get("indicators") or {}
+    market: Optional[dict[str, Any]] = None
+    index_trend = tw_ind_dict.get("trend_label")
+    vix_close = vix_data.get("close")
+    if index_trend is not None or vix_close is not None:
+        market = {
+            "index_trend": index_trend or "中性",
+            "vix": vix_close,
+        }
+
+    return assemble_2330(daily_bars, valuation, revenue_raw, t86, peer, market)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1802,6 +2160,12 @@ def main() -> int:
         upsert_report_into_store(report, store)
         tw_rows = store.get_tw_rows()
         us_rows = store.get_us_rows()
+
+        # 2330 per-stock scorecard (best-effort; never aborts index report)
+        try:
+            report["stock_2330"] = build_stock_2330(us, taiwan, report_date, store)
+        except Exception as exc:  # noqa: BLE001
+            report["stock_2330"] = {"error": str(exc)}
     finally:
         store.close()
 

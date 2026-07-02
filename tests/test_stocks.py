@@ -1,5 +1,7 @@
 import unittest
 from marketlib.stocks import _parse_stock_day, _parse_t86, _parse_bwibbu, _parse_monthly_revenue
+from marketlib.stocks import ema, macd, rsi, resample_weekly, technical_metrics
+from marketlib.core import MarketBar
 
 
 class TestStockParsers(unittest.TestCase):
@@ -113,6 +115,73 @@ class TestStockParsers(unittest.TestCase):
                   "去年同月增減(%)": "5.0", "上月比較增減(%)": "1.0", "前期比較增減(%)": "4.0"}]
         out = _parse_monthly_revenue(items, "0050")
         self.assertEqual(out["month"], "2025-12")
+
+
+class TestStockTech(unittest.TestCase):
+    def test_ema_matches_manual(self):
+        e = ema([1, 2, 3, 4, 5], 3)  # span3 alpha=0.5, seed 1
+        self.assertAlmostEqual(e[0], 1.0)
+        self.assertAlmostEqual(e[1], 1.5)
+        self.assertAlmostEqual(e[2], 2.25)
+
+    def test_macd_cross_golden(self):
+        # rising series -> dif crosses above dea -> golden at the crossing tail
+        closes = [10] * 30 + [10 + i for i in range(1, 20)]
+        m = macd(closes)
+        self.assertIsNotNone(m)
+        self.assertIn(m["cross"], ("golden", "dead", None))
+        self.assertGreater(m["dif"], m["dea"])  # uptrend: dif above dea
+
+    def test_rsi_bounds(self):
+        up = list(range(1, 40))
+        self.assertGreater(rsi(up), 70)       # all-up -> high RSI
+        down = list(range(40, 1, -1))
+        self.assertLess(rsi(down), 30)        # all-down -> low RSI
+
+    def test_resample_weekly_counts(self):
+        bars = [
+            MarketBar(date=f"2026-06-{d:02d}", close=float(d),
+                      high=float(d), low=float(d), volume=1.0)
+            for d in range(1, 15)
+        ]
+        wk = resample_weekly(bars)
+        self.assertTrue(len(wk) < len(bars) and len(wk) >= 2)
+        self.assertEqual(wk[-1].close, bars[-1].close)  # last week's close = last daily close
+
+    def test_macd_insufficient_data_returns_none(self):
+        self.assertIsNone(macd([10] * 25))  # need at least 26
+
+    def test_rsi_insufficient_data_returns_none(self):
+        self.assertIsNone(rsi([1, 2, 3]))  # need at least 14+1
+
+    def test_kd_basic(self):
+        from marketlib.stocks import kd
+        highs = list(range(100, 160))
+        lows = list(range(90, 150))
+        closes = list(range(95, 155))
+        result = kd(highs, lows, closes)
+        self.assertIsNotNone(result)
+        self.assertIn("k", result)
+        self.assertIn("d", result)
+        self.assertGreaterEqual(result["k"], 0)
+        self.assertLessEqual(result["k"], 100)
+
+    def test_technical_metrics_returns_dict(self):
+        bars = [
+            MarketBar(date=f"2026-0{1 + i // 28:01d}-{1 + i % 28:02d}",
+                      close=100.0 + i * 0.5,
+                      high=101.0 + i * 0.5,
+                      low=99.0 + i * 0.5,
+                      volume=1000.0 + i)
+            for i in range(80)
+        ]
+        m = technical_metrics(bars)
+        self.assertIsInstance(m, dict)
+        self.assertIn("close", m)
+        self.assertIn("rsi", m)
+        self.assertIn("macd_daily", m)
+        self.assertIn("macd_weekly", m)
+        self.assertIn("volume_ratio_20d", m)
 
 
 if __name__ == "__main__":

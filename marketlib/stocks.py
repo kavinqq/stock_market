@@ -1,4 +1,4 @@
-"""Per-stock TWSE data fetchers.
+"""Per-stock TWSE data fetchers and technical indicators.
 
 Pure parse functions (_parse_*) accept inline fixture payloads for testing.
 Network fetch_* wrappers call http_get_json then delegate to parsers,
@@ -7,9 +7,11 @@ returning None / [] on any failure — never raise to caller.
 from __future__ import annotations
 
 from datetime import date
+from statistics import mean
 from typing import Any, Optional
 
 from marketlib.core import MarketBar, clean_num, pct_change  # noqa: F401
+from marketlib.features import volume_ratio_excluding_t
 from marketlib.fetchers import (
     TWSE_BASE,
     http_get,  # noqa: F401
@@ -277,3 +279,232 @@ def fetch_monthly_revenue(stock_no: str) -> Optional[dict[str, Any]]:
         return _parse_monthly_revenue(items, stock_no)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------------------
+# Technical indicator helpers
+# ---------------------------------------------------------------------------
+
+
+def ema(values: list[float], span: int) -> list[float]:
+    """Compute EMA of values with given span.
+
+    Seed = first value; alpha = 2/(span+1); iterate forward.
+    Returns list of same length as values.
+    """
+    if not values:
+        return []
+    alpha = 2.0 / (span + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(alpha * v + (1 - alpha) * out[-1])
+    return out
+
+
+def macd(
+    closes: list[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> Optional[dict]:
+    """Compute MACD for closes list.
+
+    Returns dict with keys: dif, dea, hist, cross.
+    cross: "golden" if last (dif-dea) flipped negative->positive,
+           "dead" if positive->negative, else None.
+    Returns None when len(closes) < slow.
+    """
+    if len(closes) < slow:
+        return None
+
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+
+    # Align on the tail where both series exist — both have same length as closes
+    dif_series = [f - s for f, s in zip(ema_fast, ema_slow)]
+
+    dea_series = ema(dif_series, signal)
+
+    last_dif = dif_series[-1]
+    last_dea = dea_series[-1]
+    hist = last_dif - last_dea
+
+    # Cross: compare sign of (dif - dea) at last two points
+    cross = None
+    if len(dif_series) >= 2:
+        prev_diff = dif_series[-2] - dea_series[-2]
+        curr_diff = dif_series[-1] - dea_series[-1]
+        prev_sign = prev_diff >= 0
+        curr_sign = curr_diff >= 0
+        if not prev_sign and curr_sign:
+            cross = "golden"
+        elif prev_sign and not curr_sign:
+            cross = "dead"
+
+    return {"dif": last_dif, "dea": last_dea, "hist": hist, "cross": cross}
+
+
+def rsi(closes: list[float], period: int = 14) -> Optional[float]:
+    """Compute RSI using Wilder's smoothing.
+
+    Returns None when len(closes) < period + 1.
+    """
+    if len(closes) < period + 1:
+        return None
+
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(c, 0.0) for c in changes]
+    losses = [max(-c, 0.0) for c in changes]
+
+    # Seed: simple average over first period
+    avg_gain = mean(gains[:period])
+    avg_loss = mean(losses[:period])
+
+    # Wilder smoothing over remaining values
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def kd(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    n: int = 9,
+) -> Optional[dict]:
+    """Compute KD stochastic oscillator.
+
+    RSV = (close - minLow_n) / (maxHigh_n - minLow_n) * 100.
+    K and D via 3-period EMA-style smoothing seeded at 50.
+    Returns None when insufficient data (len < n).
+    """
+    if len(closes) < n or len(highs) < n or len(lows) < n:
+        return None
+
+    # Build RSV series
+    rsv_series: list[float] = []
+    for i in range(n - 1, len(closes)):
+        hi = max(highs[i - n + 1: i + 1])
+        lo = min(lows[i - n + 1: i + 1])
+        if hi == lo:
+            rsv_series.append(50.0)
+        else:
+            rsv_series.append((closes[i] - lo) / (hi - lo) * 100.0)
+
+    # K/D via EMA-3 smoothing seeded at 50
+    k = 50.0
+    d = 50.0
+    alpha = 1.0 / 3.0
+    for rsv in rsv_series:
+        k = alpha * rsv + (1 - alpha) * k
+        d = alpha * k + (1 - alpha) * d
+
+    return {"k": k, "d": d}
+
+
+def resample_weekly(bars: list[MarketBar]) -> list[MarketBar]:
+    """Group daily MarketBar list into weekly bars using ISO calendar (year, week).
+
+    Per week: close = last daily close, high = max, low = min,
+    volume = sum, date = last date in that week.
+    Returns ordered list of weekly MarketBar.
+    """
+    from datetime import date as date_cls
+    from collections import OrderedDict
+
+    groups: dict[tuple, list[MarketBar]] = OrderedDict()
+    for bar in bars:
+        d = date_cls.fromisoformat(bar.date)
+        iso_yw = d.isocalendar()[:2]  # (year, week)
+        if iso_yw not in groups:
+            groups[iso_yw] = []
+        groups[iso_yw].append(bar)
+
+    weekly: list[MarketBar] = []
+    for week_bars in groups.values():
+        last = week_bars[-1]
+        highs = [b.high for b in week_bars if b.high is not None]
+        lows = [b.low for b in week_bars if b.low is not None]
+        vols = [b.volume for b in week_bars if b.volume is not None]
+        weekly.append(
+            MarketBar(
+                date=last.date,
+                close=last.close,
+                high=max(highs) if highs else None,
+                low=min(lows) if lows else None,
+                volume=sum(vols) if vols else None,
+            )
+        )
+    return weekly
+
+
+def technical_metrics(daily_bars: list[MarketBar]) -> dict:
+    """Assemble technical metrics for a stock from its daily bar history.
+
+    Returns a flat dict with keys:
+    close, ma5, ma20, ma60, ret5, ret20, ret60, drawdown,
+    rsi, kd_k, kd_d,
+    macd_daily (dict or None), macd_weekly (dict or None),
+    volume_ratio_20d.
+    Values are None where insufficient data.
+    """
+    closes = [b.close for b in daily_bars]
+    highs = [b.high for b in daily_bars]
+    lows = [b.low for b in daily_bars]
+    volumes = [b.volume for b in daily_bars]
+
+    n = len(closes)
+
+    ma5 = mean(closes[-5:]) if n >= 5 else None
+    ma20 = mean(closes[-20:]) if n >= 20 else None
+    ma60 = mean(closes[-60:]) if n >= 60 else None
+
+    ret5 = (closes[-1] / closes[-6] - 1) if n >= 6 and closes[-6] else None
+    ret20 = (closes[-1] / closes[-21] - 1) if n >= 21 and closes[-21] else None
+    ret60 = (closes[-1] / closes[-61] - 1) if n >= 61 and closes[-61] else None
+
+    hi20 = max(closes[-20:]) if n >= 20 else None
+    drawdown = (closes[-1] / hi20 - 1) if hi20 else None
+
+    rsi_val = rsi(closes)
+
+    # KD: require high/low data
+    valid_highs = [h for h in highs if h is not None]
+    valid_lows = [l for l in lows if l is not None]
+    kd_result = None
+    if len(valid_highs) >= 9 and len(valid_lows) >= 9 and n >= 9:
+        kd_result = kd(
+            [h if h is not None else closes[i] for i, h in enumerate(highs)],
+            [l if l is not None else closes[i] for i, l in enumerate(lows)],
+            closes,
+        )
+
+    macd_daily = macd(closes)
+
+    weekly_bars = resample_weekly(daily_bars)
+    weekly_closes = [b.close for b in weekly_bars]
+    macd_weekly = macd(weekly_closes)
+
+    vol_ratio = volume_ratio_excluding_t(volumes, 20)
+
+    return {
+        "close": closes[-1] if closes else None,
+        "ma5": ma5,
+        "ma20": ma20,
+        "ma60": ma60,
+        "ret5": ret5,
+        "ret20": ret20,
+        "ret60": ret60,
+        "drawdown": drawdown,
+        "rsi": rsi_val,
+        "kd_k": kd_result["k"] if kd_result else None,
+        "kd_d": kd_result["d"] if kd_result else None,
+        "macd_daily": macd_daily,
+        "macd_weekly": macd_weekly,
+        "volume_ratio_20d": vol_ratio,
+    }

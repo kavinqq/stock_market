@@ -211,8 +211,28 @@ class TestScorecard(unittest.TestCase):
 
     def test_combine_lean_neutral_and_missing_renorm(self):
         from marketlib.stocks import combine_lean
+        # Neutral case (no None)
         out = combine_lean({"a": 0.1, "b": -0.1}, {"a": 1.0, "b": 1.0})
         self.assertEqual(out["bias"], "中性")
+        # Renormalisation: b=None → only facet "a" contributes; weight renorms to 1.0
+        # so score = 0.6 * 0.5 / 0.5 = 0.6, NOT 0.6 * 0.5 = 0.3
+        out2 = combine_lean({"a": 0.6, "b": None}, {"a": 0.5, "b": 0.5})
+        self.assertAlmostEqual(out2["score"], 0.6)
+        self.assertEqual(out2["bias"], "偏多")
+
+    def test_chip_facet_sign_correctness(self):
+        """Bearish chip (net selling) must yield score < 0; bullish must yield score > 0."""
+        from marketlib.stocks import chip_facet
+        # Net-selling input: 5 days each selling 2000 lots = total −10000 lots
+        selling = [{"inst_total_net_lots": -2000.0} for _ in range(5)]
+        f_sell = chip_facet(selling)
+        self.assertIsNotNone(f_sell["score"])
+        self.assertLess(f_sell["score"], 0, "Net-selling chip should produce a negative score")
+        # Net-buying input: 5 days each buying 2000 lots = total +10000 lots
+        buying = [{"inst_total_net_lots": 2000.0} for _ in range(5)]
+        f_buy = chip_facet(buying)
+        self.assertIsNotNone(f_buy["score"])
+        self.assertGreater(f_buy["score"], 0, "Net-buying chip should produce a positive score")
 
     def test_valuation_facet_cheap_is_bullish(self):
         from marketlib.stocks import valuation_facet

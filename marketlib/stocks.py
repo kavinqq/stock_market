@@ -886,7 +886,7 @@ def chip_facet(t86_recent: Optional[list[dict[str, Any]]]) -> dict[str, Any]:
     direction = 1.0 if total > 0 else (-1.0 if total < 0 else 0.0)
     pos_ratio = days_positive / days_n
     # Blend magnitude and consistency
-    score = _clamp(direction * (0.5 * norm + 0.5 * abs(2 * pos_ratio - 1)) * direction)
+    score = _clamp(direction * (0.5 * norm + 0.5 * abs(2 * pos_ratio - 1)))
 
     if total > 0:
         reason = f"法人近{days_n}日淨買超{total:.0f}張"
@@ -949,7 +949,7 @@ def market_facet(market: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Score overall market environment.
 
     market: dict with keys taiex_ret20 (20-day return), vix (current VIX level).
-    加權多頭(ret>0) + VIX 低(<20) → +.
+    加權多頭(ret>0) + VIX 低(<20) → +; VIX 高(>30) → −.
     """
     if not market:
         return dict(_MISSING_FACET)
@@ -972,8 +972,8 @@ def market_facet(market: Optional[dict[str, Any]]) -> dict[str, Any]:
             reasons.append(f"加權空頭({taiex_ret20:.1%})")
 
     if vix is not None:
-        # VIX: low (<15) = +0.5, medium (15-25) = 0, high (>30) = -0.5
-        if vix < 15:
+        # VIX: low (<20) = +0.5, medium (20-30) = 0, high (>30) = -0.5
+        if vix < 20:
             vix_score = 0.5
             reasons.append(f"VIX低({vix:.0f})")
         elif vix > 30:

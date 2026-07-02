@@ -88,32 +88,35 @@ class TestStockParsers(unittest.TestCase):
         self.assertIsNone(_parse_bwibbu(payload, "2330"))
 
     def test_monthly_revenue(self):
+        # Field names must use REAL TWSE prefixed keys from t187ap05_L
         items = [
             {
                 "公司代號": "2330",
                 "資料年月": "11506",
                 "營業收入-當月營收": "250000000",
-                "去年同月增減(%)": "30.5",
-                "上月比較增減(%)": "2.1",
-                "前期比較增減(%)": "28.0",
+                "營業收入-去年同月增減(%)": "30.09",
+                "營業收入-上月比較增減(%)": "1.52",
+                "累計營業收入-前期比較增減(%)": "29.98",
             }
         ]
         out = _parse_monthly_revenue(items, "2330")
         self.assertEqual(out["month"], "2026-06")
         self.assertEqual(out["revenue_thousand"], 250000000.0)
-        self.assertEqual(out["yoy_pct"], 30.5)
-        self.assertEqual(out["mom_pct"], 2.1)
-        self.assertEqual(out["cum_yoy_pct"], 28.0)
+        self.assertAlmostEqual(out["yoy_pct"], 30.09)
+        self.assertAlmostEqual(out["mom_pct"], 1.52)
+        self.assertAlmostEqual(out["cum_yoy_pct"], 29.98)
 
     def test_monthly_revenue_stock_not_found_returns_none(self):
         items = [{"公司代號": "2330", "資料年月": "11506", "營業收入-當月營收": "250000000",
-                  "去年同月增減(%)": "30.5", "上月比較增減(%)": "2.1", "前期比較增減(%)": "28.0"}]
+                  "營業收入-去年同月增減(%)": "30.09", "營業收入-上月比較增減(%)": "1.52",
+                  "累計營業收入-前期比較增減(%)": "29.98"}]
         self.assertIsNone(_parse_monthly_revenue(items, "9999"))
 
     def test_monthly_revenue_roc_date_conversion(self):
-        # ROC 11506 -> year=115+1911=2026, month=06 -> "2026-06"
+        # ROC 11412 -> year=114+1911=2025, month=12 -> "2025-12"
         items = [{"公司代號": "0050", "資料年月": "11412", "營業收入-當月營收": "1000",
-                  "去年同月增減(%)": "5.0", "上月比較增減(%)": "1.0", "前期比較增減(%)": "4.0"}]
+                  "營業收入-去年同月增減(%)": "5.0", "營業收入-上月比較增減(%)": "1.0",
+                  "累計營業收入-前期比較增減(%)": "4.0"}]
         out = _parse_monthly_revenue(items, "0050")
         self.assertEqual(out["month"], "2025-12")
 

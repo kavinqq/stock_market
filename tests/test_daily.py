@@ -151,6 +151,54 @@ def _bars():
     ]
 
 
+class TestPickQueryDate(unittest.TestCase):
+    """Unit tests for _pick_query_date date-selection helper (Bug B fix)."""
+
+    def _make_bars(self, dates):
+        from marketlib.core import MarketBar
+        return [MarketBar(date=d, close=1000.0) for d in dates]
+
+    def test_returns_latest_when_data_available(self):
+        from daily_market_report import _pick_query_date
+        bars = self._make_bars(["2026-07-01", "2026-07-02"])
+        calls = []
+
+        def fetch(stock_no, date_iso):
+            calls.append(date_iso)
+            return {"pe": 20.0} if date_iso == "2026-07-02" else None
+
+        date_used, result = _pick_query_date(bars, fetch, "2330")
+        self.assertEqual(date_used, "2026-07-02")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pe"], 20.0)
+
+    def test_falls_back_to_prior_bar_when_latest_is_none(self):
+        from daily_market_report import _pick_query_date
+        bars = self._make_bars(["2026-06-30", "2026-07-01", "2026-07-02"])
+
+        def fetch(stock_no, date_iso):
+            # Latest returns None (not yet posted), prior returns data
+            if date_iso == "2026-07-01":
+                return {"pe": 18.5}
+            return None
+
+        date_used, result = _pick_query_date(bars, fetch, "2330")
+        self.assertEqual(date_used, "2026-07-01")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pe"], 18.5)
+
+    def test_returns_latest_date_when_all_none(self):
+        from daily_market_report import _pick_query_date
+        bars = self._make_bars(["2026-06-30", "2026-07-01", "2026-07-02"])
+
+        def fetch(stock_no, date_iso):
+            return None
+
+        date_used, result = _pick_query_date(bars, fetch, "2330")
+        self.assertEqual(date_used, "2026-07-02")
+        self.assertIsNone(result)
+
+
 class TestStock2330(unittest.TestCase):
     def test_assemble_complete_with_missing_revenue(self):
         from daily_market_report import assemble_2330

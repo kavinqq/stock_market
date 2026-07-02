@@ -1875,6 +1875,31 @@ def write_outputs(report: dict[str, Any], report_dir: Path, data_dir: Path) -> t
 # 台積電 2330 multi-facet scorecard integration
 # ---------------------------------------------------------------------------
 
+
+def _pick_query_date(
+    daily_bars: list,
+    fetch_fn,
+    stock_no: str,
+    max_lookback: int = 3,
+) -> Optional[tuple[str, Any]]:
+    """Walk back through the tail of daily_bars (up to max_lookback bars) and
+    return the first (date_iso, result) for which fetch_fn returns non-None.
+
+    This handles same-day publication lag: TWSE T86/BWIBBU data for the latest
+    trading day is often not posted until after ~16:00, so we fall back to the
+    previous bar if the latest returns None.
+
+    Returns (date_iso, result) or (date_iso, None) for the latest bar if all
+    attempts return None.
+    """
+    tail = daily_bars[-(max_lookback):] if len(daily_bars) >= max_lookback else daily_bars
+    for bar in reversed(tail):
+        result = fetch_fn(stock_no, bar.date)
+        if result is not None:
+            return bar.date, result
+    # All returned None; return latest date so callers know which date was tried
+    return daily_bars[-1].date, None
+
 # Map trend_label strings to a synthetic 20-day return proxy used by market_facet.
 _TREND_TO_RET20: dict[str, float] = {
     "多頭": 0.05,
@@ -1980,17 +2005,23 @@ def build_stock_2330(
     except Exception as exc:  # noqa: BLE001
         return {"error": f"2330 price fetch failed: {exc}"}
 
+    # Use the latest ACTUAL trading bar date for per-stock TWSE queries.
+    # Today's data (end_iso) is often not posted until after ~16:00, so we
+    # walk back up to 3 bars to find the most recent date with real data.
+
     # --- T86 institutional chip (best-effort) ---
     t86: Optional[dict[str, Any]] = None
     try:
-        t86 = _stocks.fetch_t86_for_stock("2330", end_iso)
+        _t86_date, t86 = _pick_query_date(daily_bars, _stocks.fetch_t86_for_stock, "2330")
     except Exception:  # noqa: BLE001
         pass
 
     # --- Valuation PE/PB (best-effort) ---
     valuation_raw: Optional[dict[str, Any]] = None
     try:
-        valuation_raw = _stocks.fetch_valuation_for_stock("2330", end_iso)
+        _val_date, valuation_raw = _pick_query_date(
+            daily_bars, _stocks.fetch_valuation_for_stock, "2330"
+        )
     except Exception:  # noqa: BLE001
         pass
 

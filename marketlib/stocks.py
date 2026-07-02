@@ -168,9 +168,9 @@ def _parse_monthly_revenue(items: list[dict[str, Any]], stock_no: str) -> Option
             return {
                 "month": month_str,
                 "revenue_thousand": clean_num(item.get("營業收入-當月營收")),
-                "yoy_pct": clean_num(item.get("去年同月增減(%)")),
-                "mom_pct": clean_num(item.get("上月比較增減(%)")),
-                "cum_yoy_pct": clean_num(item.get("前期比較增減(%)")),
+                "yoy_pct": clean_num(item.get("營業收入-去年同月增減(%)")),
+                "mom_pct": clean_num(item.get("營業收入-上月比較增減(%)")),
+                "cum_yoy_pct": clean_num(item.get("累計營業收入-前期比較增減(%)")),
             }
         except (KeyError, ValueError, TypeError):
             continue

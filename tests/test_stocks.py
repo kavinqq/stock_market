@@ -1,6 +1,7 @@
 import unittest
 from marketlib.stocks import _parse_stock_day, _parse_t86, _parse_bwibbu, _parse_monthly_revenue
 from marketlib.stocks import ema, macd, rsi, resample_weekly, technical_metrics
+from marketlib.stocks import percentile_rank, valuation_metrics, revenue_metrics
 from marketlib.core import MarketBar
 
 
@@ -182,6 +183,22 @@ class TestStockTech(unittest.TestCase):
         self.assertIn("macd_daily", m)
         self.assertIn("macd_weekly", m)
         self.assertIn("volume_ratio_20d", m)
+
+
+class TestStockFundamental(unittest.TestCase):
+    def test_percentile_rank(self):
+        self.assertAlmostEqual(percentile_rank([10, 20, 30, 40], 25), 0.5)
+        self.assertAlmostEqual(percentile_rank([10, 20, 30, 40], 10), 0.25)
+        self.assertIsNone(percentile_rank([], 5))
+
+    def test_valuation_pct(self):
+        out = valuation_metrics(
+            {"pe": 15.0, "pb": 3.0, "dividend_yield": 2.0},
+            [10, 15, 20, 25, 30],
+            [2, 3, 4, 5, 6]
+        )
+        self.assertEqual(out["pe"], 15.0)
+        self.assertAlmostEqual(out["pe_pct"], 0.4)  # 2 of 5 <=15
 
 
 if __name__ == "__main__":

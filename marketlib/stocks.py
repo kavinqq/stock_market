@@ -508,3 +508,84 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
         "macd_weekly": macd_weekly,
         "volume_ratio_20d": vol_ratio,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fundamental metrics helpers
+# ---------------------------------------------------------------------------
+
+
+def percentile_rank(history: list[float], value: float) -> Optional[float]:
+    """Compute percentile rank of value within history.
+
+    Returns fraction of history <= value (0..1); None if history empty.
+    """
+    if not history:
+        return None
+    return sum(1 for h in history if h <= value) / len(history)
+
+
+def valuation_metrics(
+    current: Optional[dict[str, Any]],
+    pe_history: list[float],
+    pb_history: list[float],
+) -> dict[str, Any]:
+    """Compute valuation metrics with percentile ranks.
+
+    Args:
+        current: dict with keys pe, pb, dividend_yield (or None).
+        pe_history: list of PE ratios for percentile calculation.
+        pb_history: list of PB ratios for percentile calculation.
+
+    Returns:
+        dict with keys: pe, pb, dividend_yield, pe_pct, pb_pct.
+        If current is None, all values are None.
+        pe_pct/pb_pct are percentile ranks (lower = cheaper).
+    """
+    if current is None:
+        return {
+            "pe": None,
+            "pb": None,
+            "dividend_yield": None,
+            "pe_pct": None,
+            "pb_pct": None,
+        }
+
+    pe = current.get("pe")
+    pb = current.get("pb")
+    dividend_yield = current.get("dividend_yield")
+
+    pe_pct = percentile_rank(pe_history, pe) if pe is not None else None
+    pb_pct = percentile_rank(pb_history, pb) if pb is not None else None
+
+    return {
+        "pe": pe,
+        "pb": pb,
+        "dividend_yield": dividend_yield,
+        "pe_pct": pe_pct,
+        "pb_pct": pb_pct,
+    }
+
+
+def revenue_metrics(rev: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Pass through monthly revenue metrics, marking missing data.
+
+    Args:
+        rev: dict with keys yoy_pct, mom_pct, cum_yoy_pct (or None).
+
+    Returns:
+        dict with keys: yoy_pct, mom_pct, cum_yoy_pct.
+        When rev is None, all values are None.
+    """
+    if rev is None:
+        return {
+            "yoy_pct": None,
+            "mom_pct": None,
+            "cum_yoy_pct": None,
+        }
+
+    return {
+        "yoy_pct": rev.get("yoy_pct"),
+        "mom_pct": rev.get("mom_pct"),
+        "cum_yoy_pct": rev.get("cum_yoy_pct"),
+    }

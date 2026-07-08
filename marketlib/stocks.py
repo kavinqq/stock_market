@@ -209,6 +209,120 @@ def _find_all_field_indices_substring(fields: list[str], substring: str) -> list
 
 
 # ---------------------------------------------------------------------------
+# Batch all-stocks parse helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_bwibbu_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
+    """Parse BWIBBU_d valuation payload for all codes in the given set.
+
+    Returns {code: {pe, pb, dividend_yield}} for each code found in the payload.
+    Codes not present in the payload are silently skipped.
+    Reuses the same header-index helpers and substring targets as _parse_bwibbu.
+    """
+    if payload.get("stat") != "OK":
+        return {}
+    fields = payload.get("fields", [])
+    data = payload.get("data", [])
+
+    try:
+        code_idx = _find_field_index(fields, "證券代號")
+        pe_idx = _find_field_index_substring(fields, "本益比")
+        pb_idx = _find_field_index_substring(fields, "股價淨值比")
+        div_idx = _find_field_index_substring(fields, "殖利率(%)")
+    except ValueError:
+        return {}
+
+    result: dict[str, dict] = {}
+    for row in data:
+        try:
+            code = row[code_idx].strip()
+            if code not in codes:
+                continue
+            result[code] = {
+                "pe": clean_num(row[pe_idx]),
+                "pb": clean_num(row[pb_idx]),
+                "dividend_yield": clean_num(row[div_idx]),
+            }
+        except (IndexError, ValueError):
+            continue
+    return result
+
+
+def _parse_t86_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
+    """Parse T86 institutional net buy/sell payload for all codes in the given set.
+
+    Returns {code: {foreign_net_lots, trust_net_lots, dealer_net_lots, inst_total_net_lots}}
+    for each code found in the payload. Shares → lots by /1000.
+    Reuses the same header-index helpers and substring targets as _parse_t86.
+    """
+    if payload.get("stat") != "OK":
+        return {}
+    fields = payload.get("fields", [])
+    data = payload.get("data", [])
+
+    try:
+        code_idx = _find_field_index(fields, "證券代號")
+        total_idx = _find_field_index_substring(fields, "三大法人買賣超股數")
+        trust_idx = _find_field_index_substring(fields, "投信買賣超股數")
+        try:
+            foreign_idx = _find_field_index_substring(fields, "外陸資買賣超股數(不含外資自營商)")
+        except ValueError:
+            foreign_idx = _find_field_index_substring(fields, "外資買賣超股數")
+        dealer_indices = _find_all_field_indices_substring(fields, "自營商買賣超股數")
+    except ValueError:
+        return {}
+
+    result: dict[str, dict] = {}
+    for row in data:
+        try:
+            code = row[code_idx].strip()
+            if code not in codes:
+                continue
+            foreign_shares = clean_num(row[foreign_idx]) or 0.0
+            trust_shares = clean_num(row[trust_idx]) or 0.0
+            total_shares = clean_num(row[total_idx]) or 0.0
+            dealer_shares = sum(clean_num(row[i]) or 0.0 for i in dealer_indices)
+            result[code] = {
+                "foreign_net_lots": foreign_shares / 1000,
+                "trust_net_lots": trust_shares / 1000,
+                "dealer_net_lots": dealer_shares / 1000,
+                "inst_total_net_lots": total_shares / 1000,
+            }
+        except (IndexError, ValueError):
+            continue
+    return result
+
+
+def _parse_monthly_revenue_all(items: list[dict[str, Any]], codes: set) -> dict[str, dict]:
+    """Parse monthly revenue OpenAPI list for all codes in the given set.
+
+    Returns {code: {month, revenue_thousand, yoy_pct, mom_pct, cum_yoy_pct}}
+    for each code found in items. Uses the same REAL prefixed keys as _parse_monthly_revenue.
+    """
+    result: dict[str, dict] = {}
+    for item in items:
+        code = item.get("公司代號")
+        if code not in codes:
+            continue
+        try:
+            roc_ym = str(item["資料年月"])
+            year = int(roc_ym[:-2]) + 1911
+            month = int(roc_ym[-2:])
+            month_str = f"{year:04d}-{month:02d}"
+            result[code] = {
+                "month": month_str,
+                "revenue_thousand": clean_num(item.get("營業收入-當月營收")),
+                "yoy_pct": clean_num(item.get("營業收入-去年同月增減(%)")),
+                "mom_pct": clean_num(item.get("營業收入-上月比較增減(%)")),
+                "cum_yoy_pct": clean_num(item.get("累計營業收入-前期比較增減(%)")),
+            }
+        except (KeyError, ValueError, TypeError):
+            continue
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Network fetch wrappers
 # ---------------------------------------------------------------------------
 
@@ -284,6 +398,54 @@ def fetch_monthly_revenue(stock_no: str) -> Optional[dict[str, Any]]:
         return _parse_monthly_revenue(items, stock_no)
     except Exception:  # noqa: BLE001
         return None
+
+
+def fetch_valuation_all(date_iso: str, codes) -> dict[str, dict]:
+    """Fetch BWIBBU_d valuation for all stocks in one request, filter to codes.
+
+    Returns {code: {pe, pb, dividend_yield}} on success; {} on any failure.
+    """
+    try:
+        url = (
+            f"{TWSE_BASE}/afterTrading/BWIBBU_d?"
+            f"date={iso_to_yyyymmdd(date_iso)}&selectType=ALL&response=json"
+        )
+        payload = http_get_json(url)
+        return _parse_bwibbu_all(payload, set(codes))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def fetch_t86_all(date_iso: str, codes) -> dict[str, dict]:
+    """Fetch T86 institutional net buy/sell for all stocks in one request, filter to codes.
+
+    Returns {code: {foreign_net_lots, trust_net_lots, dealer_net_lots, inst_total_net_lots}}
+    on success; {} on any failure.
+    """
+    try:
+        url = (
+            f"{TWSE_BASE}/fund/T86?"
+            f"date={iso_to_yyyymmdd(date_iso)}&selectType=ALL&response=json"
+        )
+        payload = http_get_json(url)
+        return _parse_t86_all(payload, set(codes))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def fetch_monthly_revenue_all(codes) -> dict[str, dict]:
+    """Fetch latest monthly revenue for all stocks in one request, filter to codes.
+
+    Returns {code: {month, revenue_thousand, yoy_pct, mom_pct, cum_yoy_pct}}
+    on success; {} on any failure.
+    """
+    try:
+        items = http_get_json(MONTHLY_REVENUE_URL)
+        if not isinstance(items, list):
+            return {}
+        return _parse_monthly_revenue_all(items, set(codes))
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +675,56 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
         "macd_weekly": macd_weekly,
         "volume_ratio_20d": vol_ratio,
     }
+
+
+def tech_raw_score(daily_bars: list[MarketBar]) -> Optional[float]:
+    """Compute a raw 0..1 technical bullishness score from daily bar history.
+
+    Scores the fraction of these four conditions that hold:
+    1. close >= ma20
+    2. ma20 >= ma60
+    3. daily MACD bullish: cross=="golden" OR hist>0
+    4. weekly MACD hist>0
+
+    Returns the fraction of *computable* conditions that hold (0.0 to 1.0).
+    Returns None if fewer than 2 of the four conditions are computable
+    (insufficient bars to evaluate them).
+    """
+    m = technical_metrics(daily_bars)
+
+    close = m.get("close")
+    ma20 = m.get("ma20")
+    ma60 = m.get("ma60")
+    macd_daily = m.get("macd_daily")
+    macd_weekly = m.get("macd_weekly")
+
+    results: list[bool] = []
+
+    # Condition 1: close >= ma20
+    if close is not None and ma20 is not None:
+        results.append(close >= ma20)
+
+    # Condition 2: ma20 >= ma60
+    if ma20 is not None and ma60 is not None:
+        results.append(ma20 >= ma60)
+
+    # Condition 3: daily MACD bullish (golden cross OR hist > 0)
+    if macd_daily is not None:
+        cross = macd_daily.get("cross")
+        hist = macd_daily.get("hist")
+        bullish = (cross == "golden") or (hist is not None and hist > 0)
+        results.append(bullish)
+
+    # Condition 4: weekly MACD hist > 0
+    if macd_weekly is not None:
+        hist_w = macd_weekly.get("hist")
+        if hist_w is not None:
+            results.append(hist_w > 0)
+
+    if len(results) < 2:
+        return None
+
+    return sum(results) / len(results)
 
 
 # ---------------------------------------------------------------------------

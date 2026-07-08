@@ -2,6 +2,7 @@ import unittest
 from marketlib.stocks import _parse_stock_day, _parse_t86, _parse_bwibbu, _parse_monthly_revenue
 from marketlib.stocks import ema, macd, rsi, resample_weekly, technical_metrics
 from marketlib.stocks import percentile_rank, valuation_metrics, revenue_metrics
+from marketlib.stocks import _parse_bwibbu_all, _parse_t86_all, tech_raw_score
 from marketlib.core import MarketBar
 
 
@@ -294,6 +295,108 @@ class TestScorecard(unittest.TestCase):
         self.assertIn("pe", f["metrics"])
         self.assertIn("pb", f["metrics"])
         self.assertEqual(f["metrics"]["pe"], 20.0)
+
+
+class TestBatch(unittest.TestCase):
+    def test_bwibbu_all(self):
+        payload = {
+            "stat": "OK",
+            "fields": ["證券代號", "證券名稱", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"],
+            "data": [
+                ["2330", "台積電", "1.8", "2025", "20.5", "5.2", "2025/1"],
+                ["2317", "鴻海", "4.0", "2025", "12.0", "1.5", "2025/1"],
+            ],
+        }
+        out = _parse_bwibbu_all(payload, {"2330", "2317"})
+        self.assertEqual(out["2330"]["pe"], 20.5)
+        self.assertEqual(out["2317"]["pb"], 1.5)
+
+    def test_bwibbu_all_skips_missing_codes(self):
+        payload = {
+            "stat": "OK",
+            "fields": ["證券代號", "證券名稱", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"],
+            "data": [["2330", "台積電", "1.8", "2025", "20.5", "5.2", "2025/1"]],
+        }
+        out = _parse_bwibbu_all(payload, {"2330", "9999"})
+        self.assertIn("2330", out)
+        self.assertNotIn("9999", out)
+
+    def test_t86_all(self):
+        payload = {
+            "stat": "OK",
+            "fields": [
+                "證券代號",
+                "證券名稱",
+                "外陸資買賣超股數(不含外資自營商)",
+                "投信買賣超股數",
+                "自營商買賣超股數",
+                "三大法人買賣超股數",
+            ],
+            "data": [
+                ["2330", "台積電", "5000000", "1000000", "-2000000", "4000000"],
+                ["2317", "鴻海", "2000000", "500000", "300000", "2800000"],
+            ],
+        }
+        out = _parse_t86_all(payload, {"2330", "2317"})
+        self.assertEqual(out["2330"]["foreign_net_lots"], 5000.0)
+        self.assertEqual(out["2317"]["inst_total_net_lots"], 2800.0)
+
+    def test_t86_all_skips_missing_codes(self):
+        payload = {
+            "stat": "OK",
+            "fields": [
+                "證券代號",
+                "證券名稱",
+                "外陸資買賣超股數(不含外資自營商)",
+                "投信買賣超股數",
+                "自營商買賣超股數",
+                "三大法人買賣超股數",
+            ],
+            "data": [["2330", "台積電", "5000000", "1000000", "-2000000", "4000000"]],
+        }
+        out = _parse_t86_all(payload, {"2330", "9999"})
+        self.assertIn("2330", out)
+        self.assertNotIn("9999", out)
+
+    def test_monthly_revenue_all(self):
+        from marketlib.stocks import _parse_monthly_revenue_all
+        items = [
+            {
+                "公司代號": "2330",
+                "資料年月": "11506",
+                "營業收入-當月營收": "250000000",
+                "營業收入-去年同月增減(%)": "30.09",
+                "營業收入-上月比較增減(%)": "1.52",
+                "累計營業收入-前期比較增減(%)": "29.98",
+            },
+            {
+                "公司代號": "2317",
+                "資料年月": "11506",
+                "營業收入-當月營收": "50000000",
+                "營業收入-去年同月增減(%)": "5.0",
+                "營業收入-上月比較增減(%)": "2.0",
+                "累計營業收入-前期比較增減(%)": "4.5",
+            },
+        ]
+        out = _parse_monthly_revenue_all(items, {"2330", "2317"})
+        self.assertEqual(out["2330"]["month"], "2026-06")
+        self.assertAlmostEqual(out["2317"]["yoy_pct"], 5.0)
+
+    def test_tech_raw_direction(self):
+        from datetime import date, timedelta
+        base = date(2025, 1, 1)
+        up = [MarketBar(date=(base + timedelta(days=i)).isoformat(), close=100+i, high=100+i, low=100+i, volume=1e6) for i in range(80)]
+        self.assertGreater(tech_raw_score(up), 0.5)
+
+    def test_tech_raw_falling(self):
+        from datetime import date, timedelta
+        base = date(2025, 1, 1)
+        down = [MarketBar(date=(base + timedelta(days=i)).isoformat(), close=200-i, high=200-i, low=200-i, volume=1e6) for i in range(80)]
+        self.assertLess(tech_raw_score(down), 0.5)
+
+    def test_tech_raw_insufficient_bars_returns_none(self):
+        tiny = [MarketBar(date=f"2026-01-{i+1:02d}", close=100+i, high=100+i, low=100+i, volume=1e6) for i in range(3)]
+        self.assertIsNone(tech_raw_score(tiny))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,57 @@ from marketlib.stocks import _parse_stock_day, _parse_t86, _parse_bwibbu, _parse
 from marketlib.stocks import ema, macd, rsi, resample_weekly, technical_metrics
 from marketlib.stocks import percentile_rank, valuation_metrics, revenue_metrics
 from marketlib.stocks import _parse_bwibbu_all, _parse_t86_all, tech_raw_score
+from marketlib.stocks import bollinger, vwap, resample_monthly
 from marketlib.core import MarketBar
+from datetime import date, timedelta
+
+
+def _series(closes, vols=None):
+    b = date(2026, 1, 1)
+    vols = vols or [1e6] * len(closes)
+    return [
+        MarketBar(
+            date=(b + timedelta(days=i)).isoformat(),
+            close=float(c),
+            high=float(c),
+            low=float(c),
+            volume=float(v),
+        )
+        for i, (c, v) in enumerate(zip(closes, vols))
+    ]
+
+
+class TestIndicators(unittest.TestCase):
+    def test_bollinger_mid_is_sma(self):
+        out = bollinger([10] * 19 + [10], 20)  # all 10 -> stdev 0 -> pctb None, mid 10
+        self.assertAlmostEqual(out["mid"], 10.0)
+        self.assertIsNone(out["pctb"])
+
+    def test_bollinger_pctb(self):
+        out = bollinger([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 40], 20)
+        self.assertGreater(out["upper"], out["mid"])
+        self.assertTrue(0 <= out["pctb"] <= 1.5)
+
+    def test_vwap(self):
+        # closes [10,20], vols [1,3] -> (10*1+20*3)/4 = 17.5
+        self.assertAlmostEqual(vwap(_series([10, 20], [1, 3]), 2), 17.5)
+
+    def test_resample_monthly(self):
+        bars = [
+            MarketBar(date=d, close=c, high=c, low=c, volume=1.0)
+            for d, c in [("2026-01-05", 1), ("2026-01-20", 2), ("2026-02-10", 3)]
+        ]
+        m = resample_monthly(bars)
+        self.assertEqual(len(m), 2)
+        self.assertEqual(m[0].close, 2)
+
+    def test_technical_metrics_new_keys(self):
+        tm = technical_metrics(_series(list(range(1, 130))))
+        for k in ("ma120", "boll", "cost_vwap60", "price_vs_cost60", "macd_monthly"):
+            self.assertIn(k, tm)
+
+    def test_tech_raw_uses_new_signals(self):
+        self.assertGreater(tech_raw_score(_series(list(range(1, 130)))), 0.5)
 
 
 class TestStockParsers(unittest.TestCase):

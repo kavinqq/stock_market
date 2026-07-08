@@ -574,6 +574,87 @@ def kd(
     return {"k": k, "d": d}
 
 
+def bollinger(closes: list[float], n: int = 20, k: float = 2.0) -> Optional[dict]:
+    """Compute Bollinger Bands for the last n closes.
+
+    Returns {"mid", "upper", "lower", "pctb"}.
+    mid = SMA(n); upper = mid + k*pstdev; lower = mid - k*pstdev.
+    pctb = (close - lower) / (upper - lower); None when band width is 0.
+    Returns None when len(closes) < n.
+    """
+    if len(closes) < n:
+        return None
+    from statistics import pstdev
+    window = closes[-n:]
+    mid = mean(window)
+    std = pstdev(window)
+    upper = mid + k * std
+    lower = mid - k * std
+    band_width = upper - lower
+    if band_width == 0:
+        pctb = None
+    else:
+        pctb = (closes[-1] - lower) / band_width
+    return {"mid": mid, "upper": upper, "lower": lower, "pctb": pctb}
+
+
+def vwap(bars: list[MarketBar], n: int) -> Optional[float]:
+    """Compute volume-weighted average price (VWAP proxy) over last n bars.
+
+    VWAP = Σ(close * volume) / Σ(volume) over last n bars.
+    This is a 大戶成本 (institutional cost) ESTIMATE — not real broker-cost data.
+    Returns None when len(bars) < n or Σvolume == 0.
+    """
+    if len(bars) < n:
+        return None
+    window = bars[-n:]
+    total_vol = sum(b.volume for b in window if b.volume is not None)
+    if total_vol == 0:
+        return None
+    total_pv = sum(
+        b.close * b.volume
+        for b in window
+        if b.volume is not None and b.close is not None
+    )
+    return total_pv / total_vol
+
+
+def resample_monthly(bars: list[MarketBar]) -> list[MarketBar]:
+    """Group daily MarketBar list into monthly bars by (year, month).
+
+    Per month: close = last daily close, high = max, low = min,
+    volume = sum, date = last date in that month.
+    Returns ordered list of monthly MarketBar.
+    """
+    from datetime import date as date_cls
+    from collections import OrderedDict
+
+    groups: dict[tuple, list[MarketBar]] = OrderedDict()
+    for bar in bars:
+        d = date_cls.fromisoformat(bar.date)
+        ym = (d.year, d.month)
+        if ym not in groups:
+            groups[ym] = []
+        groups[ym].append(bar)
+
+    monthly: list[MarketBar] = []
+    for month_bars in groups.values():
+        last = month_bars[-1]
+        highs = [b.high for b in month_bars if b.high is not None]
+        lows = [b.low for b in month_bars if b.low is not None]
+        vols = [b.volume for b in month_bars if b.volume is not None]
+        monthly.append(
+            MarketBar(
+                date=last.date,
+                close=last.close,
+                high=max(highs) if highs else None,
+                low=min(lows) if lows else None,
+                volume=sum(vols) if vols else None,
+            )
+        )
+    return monthly
+
+
 def resample_weekly(bars: list[MarketBar]) -> list[MarketBar]:
     """Group daily MarketBar list into weekly bars using ISO calendar (year, week).
 
@@ -614,9 +695,13 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
     """Assemble technical metrics for a stock from its daily bar history.
 
     Returns a flat dict with keys:
-    close, ma5, ma20, ma60, ret5, ret20, ret60, drawdown,
-    rsi, kd_k, kd_d,
+    close, ma5, ma20, ma60, ma120, ma240,
+    ret5, ret20, ret60, drawdown,
+    rsi, kd_k, kd_d, kd (dict),
     macd_daily (dict or None), macd_weekly (dict or None),
+    macd_monthly (dict or None),
+    boll (dict or None),
+    cost_vwap60, cost_vwap120, price_vs_cost60,
     volume_ratio_20d.
     Values are None where insufficient data.
     """
@@ -630,6 +715,8 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
     ma5 = mean(closes[-5:]) if n >= 5 else None
     ma20 = mean(closes[-20:]) if n >= 20 else None
     ma60 = mean(closes[-60:]) if n >= 60 else None
+    ma120 = mean(closes[-120:]) if n >= 120 else None
+    ma240 = mean(closes[-240:]) if n >= 240 else None
 
     ret5 = (closes[-1] / closes[-6] - 1) if n >= 6 and closes[-6] else None
     ret20 = (closes[-1] / closes[-21] - 1) if n >= 21 and closes[-21] else None
@@ -657,6 +744,19 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
     weekly_closes = [b.close for b in weekly_bars]
     macd_weekly = macd(weekly_closes)
 
+    monthly_bars = resample_monthly(daily_bars)
+    monthly_closes = [b.close for b in monthly_bars]
+    macd_monthly = macd(monthly_closes)
+
+    boll = bollinger(closes)
+
+    cost_vwap60 = vwap(daily_bars, 60)
+    cost_vwap120 = vwap(daily_bars, 120)
+
+    price_vs_cost60: Optional[float] = None
+    if cost_vwap60 is not None and cost_vwap60 != 0 and closes:
+        price_vs_cost60 = closes[-1] / cost_vwap60 - 1
+
     vol_ratio = volume_ratio_excluding_t(volumes, 20)
 
     return {
@@ -664,6 +764,8 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
         "ma5": ma5,
         "ma20": ma20,
         "ma60": ma60,
+        "ma120": ma120,
+        "ma240": ma240,
         "ret5": ret5,
         "ret20": ret20,
         "ret60": ret60,
@@ -671,8 +773,14 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
         "rsi": rsi_val,
         "kd_k": kd_result["k"] if kd_result else None,
         "kd_d": kd_result["d"] if kd_result else None,
+        "kd": kd_result,
         "macd_daily": macd_daily,
         "macd_weekly": macd_weekly,
+        "macd_monthly": macd_monthly,
+        "boll": boll,
+        "cost_vwap60": cost_vwap60,
+        "cost_vwap120": cost_vwap120,
+        "price_vs_cost60": price_vs_cost60,
         "volume_ratio_20d": vol_ratio,
     }
 
@@ -680,14 +788,17 @@ def technical_metrics(daily_bars: list[MarketBar]) -> dict:
 def tech_raw_score(daily_bars: list[MarketBar]) -> Optional[float]:
     """Compute a raw 0..1 technical bullishness score from daily bar history.
 
-    Scores the fraction of these four conditions that hold:
-    1. close >= ma20
-    2. ma20 >= ma60
+    Scores the fraction of these seven conditions that hold:
+    1. close >= ma20 (月線)
+    2. ma20 >= ma60 (季線)
     3. daily MACD bullish: cross=="golden" OR hist>0
     4. weekly MACD hist>0
+    5. boll pctb > 0.5
+    6. close >= cost_vwap60 (站上大戶成本)
+    7. KD: k >= d
 
     Returns the fraction of *computable* conditions that hold (0.0 to 1.0).
-    Returns None if fewer than 2 of the four conditions are computable
+    Returns None if fewer than 2 of the conditions are computable
     (insufficient bars to evaluate them).
     """
     m = technical_metrics(daily_bars)
@@ -697,6 +808,9 @@ def tech_raw_score(daily_bars: list[MarketBar]) -> Optional[float]:
     ma60 = m.get("ma60")
     macd_daily = m.get("macd_daily")
     macd_weekly = m.get("macd_weekly")
+    boll = m.get("boll")
+    cost_vwap60 = m.get("cost_vwap60")
+    kd_result = m.get("kd")
 
     results: list[bool] = []
 
@@ -720,6 +834,18 @@ def tech_raw_score(daily_bars: list[MarketBar]) -> Optional[float]:
         hist_w = macd_weekly.get("hist")
         if hist_w is not None:
             results.append(hist_w > 0)
+
+    # Condition 5: boll pctb > 0.5
+    if boll is not None and boll.get("pctb") is not None:
+        results.append(boll["pctb"] > 0.5)
+
+    # Condition 6: close >= cost_vwap60 (站上大戶成本代理)
+    if close is not None and cost_vwap60 is not None:
+        results.append(close >= cost_vwap60)
+
+    # Condition 7: KD k >= d
+    if kd_result is not None:
+        results.append(kd_result["k"] >= kd_result["d"])
 
     if len(results) < 2:
         return None

@@ -157,5 +157,277 @@ class TestBackfillTwBlockResilient(unittest.TestCase):
         self.assertFalse(backfill._is_block_error(ValueError("some other error")))
 
 
+class TestBudget(unittest.TestCase):
+    def test_spend_within_limit_does_not_raise(self):
+        b = backfill.Budget(max_requests=3)
+        b.spend()   # 1
+        b.spend()   # 2
+        b.spend()   # 3
+        # Should not raise
+
+    def test_spend_over_limit_raises(self):
+        b = backfill.Budget(max_requests=2)
+        b.spend()
+        b.spend()
+        with self.assertRaises(backfill.BudgetExhausted):
+            b.spend()
+
+    def test_remaining(self):
+        b = backfill.Budget(max_requests=5)
+        b.spend(2)
+        self.assertEqual(b.remaining, 3)
+
+
+class FakeValuationFetcher:
+    """Fake ns for backfill_valuation — no network."""
+    def __init__(self, responses=None):
+        # responses: {date_iso: {code: {pe, pb, dividend_yield}}}
+        self.responses = responses or {}
+        self.calls = []  # record date_iso for assertion
+
+    def fetch_valuation_all(self, date_iso, codes):
+        self.calls.append(date_iso)
+        return self.responses.get(date_iso, {})
+
+
+class TestBackfillValuation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def _make_ns(self, dates, codes):
+        responses = {}
+        for d in dates:
+            responses[d] = {c: {"pe": 15.0, "pb": 2.0, "dividend_yield": 3.5} for c in codes}
+        return FakeValuationFetcher(responses)
+
+    def test_upserts_rows_and_marks_ingested(self):
+        codes = ["2330", "2317"]
+        dates = ["2026-06-20", "2026-06-21"]
+        ns = self._make_ns(dates, codes)
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_valuation(self.store, ns, codes, dates, budget, sleep=0)
+        for d in dates:
+            self.assertTrue(self.store.is_ingested("valuation", d),
+                            f"date {d} should be marked ingested")
+        for code in codes:
+            rows = self.store.get_stock_valuation(code)
+            self.assertEqual(len(rows), 2, f"{code} should have 2 valuation rows")
+            self.assertAlmostEqual(rows[0]["pe"], 15.0)
+            self.assertAlmostEqual(rows[0]["pb"], 2.0)
+            self.assertAlmostEqual(rows[0]["dividend_yield"], 3.5)
+            self.assertIsNotNone(rows[0]["asof_taipei"])
+
+    def test_second_run_skips_ingested_dates(self):
+        codes = ["2330"]
+        dates = ["2026-06-20"]
+        ns = self._make_ns(dates, codes)
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_valuation(self.store, ns, codes, dates, budget, sleep=0)
+        first_call_count = len(ns.calls)
+        backfill.backfill_valuation(self.store, ns, codes, dates, budget, sleep=0)
+        self.assertEqual(len(ns.calls), first_call_count,
+                         "Second run must not call fetch_valuation_all for ingested dates")
+
+    def test_budget_stops_early(self):
+        codes = ["2330"]
+        dates = ["2026-06-18", "2026-06-19", "2026-06-20", "2026-06-21"]
+        ns = self._make_ns(dates, codes)
+        budget = backfill.Budget(max_requests=2)
+        try:
+            backfill.backfill_valuation(self.store, ns, codes, dates, budget, sleep=0)
+        except backfill.BudgetExhausted:
+            pass  # acceptable — mid-run exhaustion is also correct
+        ingested_count = sum(1 for d in dates if self.store.is_ingested("valuation", d))
+        self.assertLessEqual(ingested_count, 2,
+                             "Budget=2 must stop after at most 2 fetches")
+        not_ingested = [d for d in dates if not self.store.is_ingested("valuation", d)]
+        self.assertGreater(len(not_ingested), 0,
+                           "Some dates must remain un-ingested so next run can resume")
+
+
+class TestCoverage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def test_coverage_empty_db(self):
+        result = backfill.coverage(self.store, start="2020-01-01")
+        for key in ("tw_daily", "us_daily", "finra_monthly",
+                    "stock_valuation", "stock_daily"):
+            self.assertIn(key, result)
+        self.assertEqual(result["tw_daily"]["rows"], 0)
+        self.assertEqual(result["stock_valuation"]["rows"], 0)
+
+    def test_coverage_with_data(self):
+        self.store.upsert_tw_daily({
+            "date": "2026-01-02",
+            "close": 20000.0,
+            "price_asof_taipei": "2026-01-02T14:30:00+08:00",
+            "available_at_taipei": "2026-01-02T16:30:00+08:00",
+        })
+        self.store.upsert_stock_valuation({
+            "stock_no": "2330",
+            "date": "2026-01-02",
+            "pe": 18.0,
+            "pb": 3.0,
+            "dividend_yield": 2.5,
+            "asof_taipei": "2026-01-02T14:30:00+08:00",
+        })
+        result = backfill.coverage(self.store, start="2020-01-01")
+        self.assertEqual(result["tw_daily"]["rows"], 1)
+        self.assertEqual(result["tw_daily"]["min_date"], "2026-01-02")
+        self.assertEqual(result["stock_valuation"]["rows"], 1)
+        self.assertEqual(result["stock_valuation"]["min_date"], "2026-01-02")
+        pct = result["tw_daily"].get("pct_filled")
+        if pct is not None:
+            self.assertGreaterEqual(pct, 0.0)
+
+    def test_coverage_no_network(self):
+        try:
+            backfill.coverage(self.store, start="2014-01-01")
+        except Exception as exc:
+            self.fail(f"coverage() raised unexpectedly: {exc}")
+
+    def test_print_coverage_no_error(self):
+        info = backfill.coverage(self.store, start="2020-01-01")
+        try:
+            backfill._print_coverage(info)
+        except Exception as exc:
+            self.fail(f"_print_coverage raised unexpectedly: {exc}")
+
+
+class FakeIncrementalNS:
+    """Fake namespace for incremental_run tests (no network)."""
+    def __init__(self, codes=None):
+        self.codes = codes or []
+        self.val_calls = []
+        self.stock_day_calls = []
+        self.market_month_calls = []
+
+    def fetch_valuation_all(self, date_iso, codes):
+        self.val_calls.append(date_iso)
+        return {c: {"pe": 18.0, "pb": 3.0, "dividend_yield": 2.5} for c in codes}
+
+    def fetch_stock_day(self, stock_no, month_start):
+        self.stock_day_calls.append((stock_no, month_start))
+        return []
+
+    def fetch_twse_market_month(self, month_start):
+        self.market_month_calls.append(month_start)
+        return []
+
+    def fetch_twse_institutional(self, date_iso):
+        return {}
+
+    def fetch_twse_margin(self, date_iso):
+        return {}
+
+    def fetch_twse_summary(self, date_iso):
+        return {}
+
+
+class TestBackfillStockDayMonth(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def test_upserts_and_marks_ingested(self):
+        ns = FakeIncrementalNS(codes=["2330"])
+        ns.fetch_stock_day = lambda s, m: [MarketBar(date="2026-05-05", close=800.0,
+                                                     open=790.0, high=805.0, low=788.0,
+                                                     volume=1e7)]
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 5, 1),
+                                          budget, sleep=0)
+        rows = self.store.get_stock_daily("2330")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["close"], 800.0)
+        self.assertTrue(self.store.is_ingested("stock_day", "stock_day:2330:2026-05"))
+
+    def test_second_run_skips(self):
+        ns = FakeIncrementalNS(codes=["2330"])
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 5, 1),
+                                          budget, sleep=0)
+        n_first = len(ns.stock_day_calls)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 5, 1),
+                                          budget, sleep=0)
+        self.assertEqual(len(ns.stock_day_calls), n_first,
+                         "Second run must skip already-ingested stock_day month")
+
+
+class TestIncrementalRun(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+        for d in ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]:
+            self.store.upsert_tw_daily({
+                "date": d,
+                "close": 20000.0,
+                "price_asof_taipei": f"{d}T14:30:00+08:00",
+                "available_at_taipei": f"{d}T16:30:00+08:00",
+            })
+
+    def test_valuation_dates_ingested_after_run(self):
+        ns = FakeIncrementalNS(codes=["2330"])
+        budget = backfill.Budget(max_requests=50)
+        backfill.incremental_run(self.store, ns, start=date(2026, 1, 1),
+                                 budget=budget, sleep=0)
+        ingested = [d for d in ["2026-01-02", "2026-01-05", "2026-01-06",
+                                 "2026-01-07", "2026-01-08"]
+                    if self.store.is_ingested("valuation", d)]
+        self.assertGreater(len(ingested), 0,
+                           "incremental_run must ingest at least one valuation date")
+
+    def test_budget_stops_run_cleanly(self):
+        ns = FakeIncrementalNS(codes=["2330"])
+        budget = backfill.Budget(max_requests=2)
+        try:
+            backfill.incremental_run(self.store, ns, start=date(2026, 1, 1),
+                                     budget=budget, sleep=0)
+        except Exception as exc:
+            self.fail(f"incremental_run raised unexpectedly with small budget: {exc}")
+        self.assertLessEqual(budget.remaining, 0)
+
+    def test_already_ingested_valuation_dates_skipped(self):
+        self.store.mark_ingested("valuation", "2026-01-02")
+        self.store.mark_ingested("valuation", "2026-01-05")
+        ns = FakeIncrementalNS(codes=["2330"])
+        budget = backfill.Budget(max_requests=50)
+        backfill.incremental_run(self.store, ns, start=date(2026, 1, 1),
+                                 budget=budget, sleep=0)
+        self.assertNotIn("2026-01-02", ns.val_calls)
+        self.assertNotIn("2026-01-05", ns.val_calls)
+
+
+class TestBackfillTwBudget(unittest.TestCase):
+    """Optional budget threading into backfill_tw is backward compatible."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def test_budget_none_unlimited(self):
+        # Default budget=None → behaves as before (no BudgetExhausted).
+        backfill.backfill_tw(self.store, FakeFetchers(), [date(2026, 6, 1)], sleep=0)
+        self.assertTrue(self.store.is_ingested("tw_month", "2026-06"))
+
+    def test_budget_counts_fetches(self):
+        # With a real budget, fetches are counted; tiny budget stops early.
+        budget = backfill.Budget(max_requests=1)
+        try:
+            backfill.backfill_tw(self.store, FakeFetchers(), [date(2026, 6, 1)],
+                                 sleep=0, budget=budget)
+        except backfill.BudgetExhausted:
+            pass
+        # Budget consumed at least one request
+        self.assertLessEqual(budget.remaining, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

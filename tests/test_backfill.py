@@ -88,5 +88,74 @@ class TestBackfillUsVixOnly(unittest.TestCase):
         self.assertIsNotNone(r_both["available_at_taipei"])
 
 
+class FakeBlockingFetchers:
+    """Fake fetcher where fetch_twse_margin always raises a TWSE block error."""
+    def fetch_twse_market_month(self, month_start):
+        return [MarketBar(date="2020-02-13", close=9500.0, turnover=1e11, volume=5e8)]
+
+    def fetch_twse_institutional(self, date_iso):
+        return {"rows": {"合計": {"net_ntd": 3.5e9}}}
+
+    def fetch_twse_margin(self, date_iso):
+        raise RuntimeError("... FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED ...")
+
+    def fetch_twse_summary(self, date_iso):
+        return {"breadth": {"上漲": {"stocks": 500}, "下跌": {"stocks": 250}}}
+
+
+class TestBackfillTwBlockResilient(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+        self.fetcher = FakeBlockingFetchers()
+
+    def _run_backfill(self):
+        backfill.backfill_tw(
+            self.store,
+            self.fetcher,
+            [date(2020, 2, 1)],
+            sleep=0,
+            backoff=0.0,
+            max_retries=3,
+        )
+
+    def test_block_does_not_propagate(self):
+        """backfill_tw must not raise even when margin fetch is always blocked."""
+        try:
+            self._run_backfill()
+        except Exception as exc:
+            self.fail(f"backfill_tw raised an exception: {exc}")
+
+    def test_block_month_not_marked_ingested(self):
+        """Month with an unrecovered block must NOT be marked ingested (resume integrity)."""
+        self._run_backfill()
+        self.assertFalse(
+            self.store.is_ingested("tw_month", "2020-02"),
+            "Month should NOT be marked ingested when a block exhausted all retries",
+        )
+
+    def test_block_price_data_still_stored(self):
+        """Price data from fetch_twse_market_month must be stored despite margin block."""
+        self._run_backfill()
+        rows = self.store.get_tw_rows()
+        self.assertEqual(len(rows), 1, "Expected exactly 1 row from the one MarketBar")
+        self.assertAlmostEqual(rows[0]["close"], 9500.0)
+
+    def test_is_block_error_detection(self):
+        """Unit test the _is_block_error helper function."""
+        self.assertTrue(
+            backfill._is_block_error(
+                RuntimeError("FOR SECURITY REASONS, THIS PAGE CAN NOT BE ACCESSED")
+            )
+        )
+        self.assertTrue(backfill._is_block_error(RuntimeError("無法呈現")))
+        self.assertTrue(
+            backfill._is_block_error(RuntimeError("SECURITY REASONS something else"))
+        )
+        self.assertFalse(backfill._is_block_error(RuntimeError("connection timeout")))
+        self.assertFalse(backfill._is_block_error(ValueError("some other error")))
+
+
 if __name__ == "__main__":
     unittest.main()

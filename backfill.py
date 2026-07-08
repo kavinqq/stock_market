@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline multi-year history backfill into SQLite (point-in-time aware)."""
 from __future__ import annotations
-import argparse, time
+import argparse, random, sys, time
 from datetime import date, datetime
 from marketlib import fetchers as F
 from marketlib.store import HistoryStore
@@ -10,15 +10,83 @@ def _max_asof(*vals):
     present = [v for v in vals if v]
     return max(present) if present else None
 
-def backfill_tw(store, ns, months, sleep: float = 0.5) -> None:
+def _is_block_error(exc: BaseException) -> bool:
+    """Return True when exc text indicates a TWSE anti-scraping block."""
+    msg = str(exc)
+    return any(kw in msg for kw in ("無法呈現", "CAN NOT BE ACCESSED", "SECURITY REASONS"))
+
+def backfill_tw(store, ns, months, sleep: float = 1.5,
+                max_retries: int = 3, backoff: float = 30.0) -> None:
     for month_start in months:
         key = month_start.strftime("%Y-%m")
+        month_had_block = False
         bars = ns.fetch_twse_market_month(month_start)
         for bar in bars:
             d = bar.date
-            inst = ns.fetch_twse_institutional(d) or {}
-            margin = ns.fetch_twse_margin(d) or {}
-            summary = ns.fetch_twse_summary(d) or {}
+
+            # --- fetch_twse_institutional with block-retry ---
+            inst = {}
+            for attempt in range(max_retries + 1):
+                try:
+                    inst = ns.fetch_twse_institutional(d) or {}
+                    break
+                except Exception as exc:
+                    if _is_block_error(exc):
+                        if attempt < max_retries:
+                            wait = backoff * (2 ** attempt)
+                            wait = min(wait, backoff * 8)
+                            time.sleep(wait)
+                        else:
+                            month_had_block = True
+                            inst = {}
+                    else:
+                        print(f"[backfill_tw] institutional fetch error on {d}: {exc}",
+                              file=sys.stderr)
+                        inst = {}
+                        break
+
+            # --- fetch_twse_margin with block-retry ---
+            margin = {}
+            for attempt in range(max_retries + 1):
+                try:
+                    margin = ns.fetch_twse_margin(d) or {}
+                    break
+                except Exception as exc:
+                    if _is_block_error(exc):
+                        if attempt < max_retries:
+                            wait = backoff * (2 ** attempt)
+                            wait = min(wait, backoff * 8)
+                            time.sleep(wait)
+                        else:
+                            month_had_block = True
+                            margin = {}
+                    else:
+                        print(f"[backfill_tw] margin fetch error on {d}: {exc}",
+                              file=sys.stderr)
+                        margin = {}
+                        break
+
+            # --- fetch_twse_summary with block-retry ---
+            summary = {}
+            for attempt in range(max_retries + 1):
+                try:
+                    summary = ns.fetch_twse_summary(d) or {}
+                    break
+                except Exception as exc:
+                    if _is_block_error(exc):
+                        if attempt < max_retries:
+                            wait = backoff * (2 ** attempt)
+                            wait = min(wait, backoff * 8)
+                            time.sleep(wait)
+                        else:
+                            month_had_block = True
+                            summary = {}
+                    else:
+                        print(f"[backfill_tw] summary fetch error on {d}: {exc}",
+                              file=sys.stderr)
+                        summary = {}
+                        break
+
             net = (inst.get("rows", {}).get("合計") or {}).get("net_ntd")
             fin = margin.get("margin_financing") or {}
             breadth = summary.get("breadth") or {}
@@ -44,15 +112,37 @@ def backfill_tw(store, ns, months, sleep: float = 0.5) -> None:
                 "missing_fields": ",".join(missing) if missing else None,
             })
             if sleep:
-                time.sleep(sleep)
-        store.mark_ingested("tw_month", key)
+                time.sleep(sleep + random.uniform(0, 0.5))
+        if not month_had_block:
+            store.mark_ingested("tw_month", key)
 
-def backfill_us(store, start: date, end: date, sleep: float = 0.5) -> None:
-    spy = {b.date: b for b in F.fetch_nasdaq_history("SPY", "etf", start, end)}
-    qqq = {b.date: b for b in F.fetch_nasdaq_history("QQQ", "etf", start, end)}
-    iwm = {b.date: b for b in F.fetch_nasdaq_history("IWM", "etf", start, end)}
-    comp = {b.date: b for b in F.fetch_nasdaq_history("COMP", "index", start, end)}
-    vix = {b.date: b for b in F.fetch_vix_history(start, end)}
+def backfill_us(store, start: date, end: date, sleep: float = 0.5,
+                max_retries: int = 3) -> None:
+    try:
+        spy = {b.date: b for b in F.fetch_nasdaq_history("SPY", "etf", start, end)}
+    except Exception as exc:
+        print(f"[backfill_us] SPY fetch error: {exc}", file=sys.stderr)
+        spy = {}
+    try:
+        qqq = {b.date: b for b in F.fetch_nasdaq_history("QQQ", "etf", start, end)}
+    except Exception as exc:
+        print(f"[backfill_us] QQQ fetch error: {exc}", file=sys.stderr)
+        qqq = {}
+    try:
+        iwm = {b.date: b for b in F.fetch_nasdaq_history("IWM", "etf", start, end)}
+    except Exception as exc:
+        print(f"[backfill_us] IWM fetch error: {exc}", file=sys.stderr)
+        iwm = {}
+    try:
+        comp = {b.date: b for b in F.fetch_nasdaq_history("COMP", "index", start, end)}
+    except Exception as exc:
+        print(f"[backfill_us] COMP fetch error: {exc}", file=sys.stderr)
+        comp = {}
+    try:
+        vix = {b.date: b for b in F.fetch_vix_history(start, end)}
+    except Exception as exc:
+        print(f"[backfill_us] VIX fetch error: {exc}", file=sys.stderr)
+        vix = {}
     for d in sorted(set(spy) | set(vix)):
         store.upsert_us_daily({
             "date": d,
@@ -73,7 +163,11 @@ def backfill_us(store, start: date, end: date, sleep: float = 0.5) -> None:
         })
 
 def backfill_finra(store) -> None:
-    data = F.fetch_finra_margin_statistics()
+    try:
+        data = F.fetch_finra_margin_statistics()
+    except Exception as exc:
+        print(f"[backfill_finra] fetch error: {exc}", file=sys.stderr)
+        return
     if not data:
         return
     for row in data.get("rows", []):
@@ -98,7 +192,9 @@ def main() -> int:
     p.add_argument("--start", default="2014-01-01")
     p.add_argument("--end", default=datetime.now(F.TAIPEI_TZ).date().isoformat())
     p.add_argument("--sources", default="tw,us,finra")
-    p.add_argument("--sleep", type=float, default=0.5)
+    p.add_argument("--sleep", type=float, default=1.5)
+    p.add_argument("--max-retries", type=int, default=3, dest="max_retries")
+    p.add_argument("--backoff", type=float, default=30.0)
     a = p.parse_args()
     store = HistoryStore(a.db); store.init_schema()
     start = datetime.strptime(a.start, "%Y-%m-%d").date()
@@ -111,9 +207,10 @@ def main() -> int:
             if not store.is_ingested("tw_month", cur.strftime("%Y-%m")):
                 months.append(cur)
             cur = date(cur.year + 1, 1, 1) if cur.month == 12 else date(cur.year, cur.month + 1, 1)
-        backfill_tw(store, F, months, sleep=a.sleep)
+        backfill_tw(store, F, months, sleep=a.sleep,
+                    max_retries=a.max_retries, backoff=a.backoff)
     if "us" in sources:
-        backfill_us(store, start, end, sleep=a.sleep)
+        backfill_us(store, start, end, sleep=a.sleep, max_retries=a.max_retries)
     if "finra" in sources:
         backfill_finra(store)
     store.close()

@@ -1023,6 +1023,91 @@ def _lean_tone(bias: str) -> str:
     return "warn"
 
 
+def _fmt_macd_row(label: str, m: Optional[dict[str, Any]]) -> str:
+    """Render one MACD row (日/週/月) as a <li>."""
+    if m is None:
+        return f"{label} MACD：N/A"
+    dif = fmt_num(m.get("dif"), 2)
+    dea = fmt_num(m.get("dea"), 2)
+    hist = fmt_num(m.get("hist"), 2)
+    cross = m.get("cross")
+    cross_str = ""
+    if cross == "golden":
+        cross_str = "【金叉】"
+    elif cross == "dead":
+        cross_str = "【死叉】"
+    return f"{label} MACD：DIF {dif} / DEA {dea} / 柱 {hist}{cross_str}"
+
+
+def _html_tech_indicators_panel(tm: dict[str, Any]) -> str:
+    """Build the 技術指標 panel HTML from a technical_metrics dict."""
+    # Moving averages
+    ma_items = [
+        f"週線 MA5：{fmt_num(tm.get('ma5'), 2)}",
+        f"月線 MA20：{fmt_num(tm.get('ma20'), 2)}",
+        f"季線 MA60：{fmt_num(tm.get('ma60'), 2)}",
+        f"半年線 MA120：{fmt_num(tm.get('ma120'), 2)}",
+        f"年線 MA240：{fmt_num(tm.get('ma240'), 2)}",
+    ]
+
+    # Bollinger
+    boll = tm.get("boll")
+    if boll is not None:
+        boll_items = [
+            f"上軌：{fmt_num(boll.get('upper'), 2)}",
+            f"中軌：{fmt_num(boll.get('mid'), 2)}",
+            f"下軌：{fmt_num(boll.get('lower'), 2)}",
+            f"%B：{fmt_num(boll.get('pctb'), 3) if boll.get('pctb') is not None else 'N/A'}",
+        ]
+    else:
+        boll_items = ["布林通道資料不足"]
+
+    # MACD
+    macd_items = [
+        _fmt_macd_row("日", tm.get("macd_daily")),
+        _fmt_macd_row("週", tm.get("macd_weekly")),
+        _fmt_macd_row("月", tm.get("macd_monthly")),
+    ]
+
+    # KD
+    kd_k = fmt_num(tm.get("kd_k"), 2)
+    kd_d = fmt_num(tm.get("kd_d"), 2)
+    kd_items = [f"K：{kd_k}", f"D：{kd_d}"]
+
+    # 大戶成本 (VWAP estimate)
+    cost_items = [
+        f"VWAP60：{fmt_num(tm.get('cost_vwap60'), 2)}",
+        f"VWAP120：{fmt_num(tm.get('cost_vwap120'), 2)}",
+        f"現價相對VWAP60：{fmt_pct(tm.get('price_vs_cost60'))}",
+        "（估計,非真實分點成本）",
+    ]
+
+    def _sub_panel(title: str, items: list[str]) -> str:
+        return (
+            f'<div class="panel" style="margin-bottom:10px">'
+            f'<strong>{esc(title)}</strong>'
+            + bullet_list(items)
+            + '</div>'
+        )
+
+    return (
+        '<div class="panel">'
+        '<h2>技術指標</h2>'
+        '<div class="split">'
+        '<div>'
+        + _sub_panel("均線", ma_items)
+        + _sub_panel("布林通道", boll_items)
+        + '</div>'
+        '<div>'
+        + _sub_panel("MACD", macd_items)
+        + _sub_panel("KD", kd_items)
+        + _sub_panel("大戶成本（估計）", cost_items)
+        + '</div>'
+        '</div>'
+        '</div>'
+    )
+
+
 def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
     """Render the 台積電 2330 HTML section."""
     if not stock or "error" in stock:
@@ -1039,6 +1124,7 @@ def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
     medium_lean = stock.get("medium_lean") or {}
     missing = stock.get("missing") or []
     levels = stock.get("observe_levels") or {}
+    tm = stock.get("technical_metrics") or {}
 
     # Facet cards
     facet_names = {
@@ -1071,6 +1157,9 @@ def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
 
     missing_note = f"缺少資料：{', '.join(missing)}" if missing else "各構面資料完整"
 
+    # Technical indicators panel (rendered from full technical_metrics)
+    tech_indicators_html = _html_tech_indicators_panel(tm)
+
     return (
         '<section id="stock2330" class="page">'
         '<div class="hero">'
@@ -1089,7 +1178,8 @@ def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
             f"MA5 {fmt_num(levels.get('ma5'), 2)}，MA20 {fmt_num(levels.get('ma20'), 2)}，MA60 {fmt_num(levels.get('ma60'), 2)}",
         ]) +
         '</div>'
-        f'<p class="subtle">{esc(missing_note)}</p>'
+        + tech_indicators_html
+        + f'<p class="subtle">{esc(missing_note)}</p>'
         '</section>'
     )
 
@@ -1291,11 +1381,12 @@ def render_markdown(report: dict[str, Any]) -> str:
     if not screener:
         lines.append("- 資料不足，無法顯示 0050 潛力股排名。")
     else:
-        lines.append("| 名次 | 代號 | 綜合分 | 估值 | 營收 | 技術 | 動能 | 籌碼 | PE | 營收YoY% | 20日報酬 |")
-        lines.append("|------|------|--------|------|------|------|------|------|-----|-----------|---------|")
+        lines.append("| 名次 | 代號 | 名稱 | 綜合分 | 估值 | 營收 | 技術 | 動能 | 籌碼 | PE | 營收YoY% | 20日報酬 |")
+        lines.append("|------|------|------|--------|------|------|------|------|------|-----|-----------|---------|")
         for item in screener[:15]:
             rank = item.get("rank", "")
             code = item.get("code", "")
+            name = item.get("name") or code
             composite = item.get("composite")
             scores = item.get("scores") or {}
             raw = item.get("raw") or {}
@@ -1310,7 +1401,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             rev_yoy_str = fmt_pct(rev_yoy / 100 if rev_yoy is not None else None)
             ret20_str = fmt_pct(raw.get("ret20"))
             lines.append(
-                f"| {rank} | {code} | {composite_str} | {val_str} | {rev_str} | "
+                f"| {rank} | {code} | {name} | {composite_str} | {val_str} | {rev_str} | "
                 f"{tech_str} | {mom_str} | {chip_str} | {pe_str} | {rev_yoy_str} | {ret20_str} |"
             )
         lines.append("")
@@ -2035,6 +2126,9 @@ def assemble_2330(
         "close": tech_m.get("close"),
     }
 
+    # Attach full technical_metrics for display in HTML (all indicators)
+    scorecard["technical_metrics"] = tech_m
+
     return scorecard
 
 
@@ -2055,7 +2149,7 @@ def build_stock_2330(
 
     # --- Core: 2330 daily price history (required) ---
     try:
-        daily_bars = _stocks.fetch_stock_history("2330", end, lookback_months=5)
+        daily_bars = _stocks.fetch_stock_history("2330", end, lookback_months=14)
         if not daily_bars:
             raise ValueError("empty 2330 price history")
     except Exception as exc:  # noqa: BLE001
@@ -2215,8 +2309,10 @@ def assemble_screener(
         rev = revenue_by_code.get(c) or {}
         chip = chip_by_code.get(c) or {}
         tech = tech_by_code.get(c) or {}
+        name = _stocks.resolve_name(c, valuation_by_code, chip_by_code)
         records.append({
             "code": c,
+            "name": name,
             "pe": val.get("pe"),
             "pb": val.get("pb"),
             "dividend_yield": val.get("dividend_yield"),
@@ -2226,7 +2322,13 @@ def assemble_screener(
             "ret20": tech.get("ret20"),
             "ret60": tech.get("ret60"),
         })
-    return _screener.build_screener(records)
+    ranked = _screener.build_screener(records)
+    # Re-attach name to ranked rows (build_screener may not carry it through)
+    name_by_code = {r["code"]: r.get("name", r["code"]) for r in records}
+    for row in ranked:
+        if "name" not in row or not row["name"]:
+            row["name"] = name_by_code.get(row.get("code", ""), row.get("code", ""))
+    return ranked
 
 
 def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
@@ -2364,6 +2466,7 @@ def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
     for item in screener_data:
         rank = item.get("rank", "")
         code = item.get("code", "")
+        name = item.get("name") or code
         composite = item.get("composite")
         scores = item.get("scores") or {}
         raw = item.get("raw") or {}
@@ -2382,6 +2485,7 @@ def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
             "<tr>"
             f"<td>{esc(str(rank))}</td>"
             f"<td>{esc(code)}</td>"
+            f"<td>{esc(name)}</td>"
             f"<td><strong>{esc(composite_str)}</strong></td>"
             f"<td>{esc(val_str)}</td>"
             f"<td>{esc(rev_str)}</td>"
@@ -2405,7 +2509,7 @@ def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
         '<div style="overflow-x:auto">'
         '<table>'
         '<thead><tr>'
-        '<th>名次</th><th>代號</th><th>綜合分</th>'
+        '<th>名次</th><th>代號</th><th>名稱</th><th>綜合分</th>'
         '<th>估值</th><th>營收</th><th>技術</th><th>動能</th><th>籌碼</th>'
         '<th>PE</th><th>營收YoY%</th><th>20日報酬</th>'
         '</tr></thead>'

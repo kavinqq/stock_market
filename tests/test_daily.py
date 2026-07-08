@@ -333,5 +333,148 @@ class TestScreener0050(unittest.TestCase):
         self.assertIsNotNone(out[0]["composite"])
 
 
+class TestScreenerNames(unittest.TestCase):
+    """assemble_screener must propagate 'name' from valuation/chip sources."""
+
+    def _make_val(self, name: str) -> dict:
+        return {"pe": 15.0, "pb": 2.0, "dividend_yield": 2.0, "name": name}
+
+    def _make_chip(self, name: str) -> dict:
+        return {"inst_total_net_lots": 1000.0, "name": name}
+
+    def test_name_from_valuation_source(self):
+        from daily_market_report import assemble_screener
+        codes = ["2330", "2303"]
+        val = {"2330": self._make_val("台積電"), "2303": self._make_val("聯電")}
+        out = assemble_screener(codes, val, {}, {}, {})
+        by_code = {r["code"]: r for r in out}
+        self.assertEqual(by_code["2330"]["name"], "台積電")
+        self.assertEqual(by_code["2303"]["name"], "聯電")
+
+    def test_name_from_chip_source_when_val_missing(self):
+        from daily_market_report import assemble_screener
+        codes = ["2454"]
+        chip = {"2454": self._make_chip("聯發科")}
+        out = assemble_screener(codes, {}, {}, chip, {})
+        self.assertEqual(out[0]["name"], "聯發科")
+
+    def test_name_falls_back_to_code_when_unknown(self):
+        from daily_market_report import assemble_screener
+        codes = ["XXXX"]
+        out = assemble_screener(codes, {}, {}, {}, {})
+        self.assertEqual(out[0]["name"], "XXXX")
+
+    def test_name_present_in_existing_rank_test(self):
+        """Ensure name key exists even in existing test scenario (no regression)."""
+        from daily_market_report import assemble_screener
+        codes = ["A", "B"]
+        val = {"A": {"pe": 10, "pb": 1, "dividend_yield": 3}, "B": {"pe": 40, "pb": 8, "dividend_yield": 0.5}}
+        out = assemble_screener(codes, val, {}, {}, {})
+        for row in out:
+            self.assertIn("name", row)
+
+
+class TestStock2330TechnicalBlock(unittest.TestCase):
+    """html_stock_2330_section must render the technical indicators block."""
+
+    def _make_synthetic_stock(self) -> dict:
+        """Build a minimal synthetic stock_2330 dict with technical_metrics populated."""
+        return {
+            "facets": {
+                "technical": {"score": 0.5, "reason": "OK"},
+                "volume": {"score": 0.3, "reason": "OK"},
+                "chip": {"score": 0.1, "reason": "OK"},
+                "valuation": {"score": -0.2, "reason": "OK"},
+                "revenue": {"score": None, "reason": "缺資料"},
+                "peer": {"score": 0.0, "reason": "OK"},
+                "market": {"score": 0.2, "reason": "OK"},
+            },
+            "short_lean": {"bias": "偏多", "confidence": "中", "score": 0.4},
+            "medium_lean": {"bias": "偏多", "confidence": "低", "score": 0.3},
+            "missing": ["revenue"],
+            "observe_levels": {
+                "close": 980.0,
+                "support_20d": 950.0,
+                "resistance_20d": 1000.0,
+                "ma5": 975.0,
+                "ma20": 960.0,
+                "ma60": 930.0,
+            },
+            "technical_metrics": {
+                "close": 980.0,
+                "ma5": 975.0,
+                "ma20": 960.0,
+                "ma60": 930.0,
+                "ma120": 900.0,
+                "ma240": 850.0,
+                "boll": {"mid": 960.0, "upper": 1010.0, "lower": 910.0, "pctb": 0.7},
+                "macd_daily": {"dif": 5.0, "dea": 3.0, "hist": 2.0, "cross": "golden"},
+                "macd_weekly": {"dif": 8.0, "dea": 6.0, "hist": 2.0, "cross": None},
+                "macd_monthly": {"dif": 12.0, "dea": 10.0, "hist": 2.0, "cross": None},
+                "kd_k": 65.0,
+                "kd_d": 60.0,
+                "kd": {"k": 65.0, "d": 60.0},
+                "cost_vwap60": 940.0,
+                "cost_vwap120": 920.0,
+                "price_vs_cost60": 0.043,
+                "rsi": 58.0,
+                "ret5": 0.01,
+                "ret20": 0.02,
+                "ret60": 0.05,
+                "drawdown": -0.02,
+                "volume_ratio_20d": 1.1,
+            },
+        }
+
+    def test_renders_ma_labels(self):
+        from daily_market_report import html_stock_2330_section
+        html = html_stock_2330_section(self._make_synthetic_stock())
+        self.assertIn("年線", html)
+        self.assertIn("半年線", html)
+        self.assertIn("季線", html)
+        self.assertIn("月線", html)
+        self.assertIn("週線", html)
+
+    def test_renders_boll_label(self):
+        from daily_market_report import html_stock_2330_section
+        html = html_stock_2330_section(self._make_synthetic_stock())
+        self.assertIn("布林", html)
+
+    def test_renders_cost_label(self):
+        from daily_market_report import html_stock_2330_section
+        html = html_stock_2330_section(self._make_synthetic_stock())
+        self.assertIn("大戶成本", html)
+        self.assertIn("估計", html)
+
+    def test_renders_macd_labels(self):
+        from daily_market_report import html_stock_2330_section
+        html = html_stock_2330_section(self._make_synthetic_stock())
+        self.assertIn("MACD", html)
+
+    def test_renders_kd_label(self):
+        from daily_market_report import html_stock_2330_section
+        html = html_stock_2330_section(self._make_synthetic_stock())
+        self.assertIn("KD", html)
+
+    def test_missing_technical_metrics_degrades_gracefully(self):
+        """stock_2330 without technical_metrics key should still render without crash."""
+        from daily_market_report import html_stock_2330_section
+        stock = self._make_synthetic_stock()
+        del stock["technical_metrics"]
+        html = html_stock_2330_section(stock)
+        self.assertIn("台積電", html)
+        self.assertIn("N/A", html)
+
+    def test_none_indicators_show_na(self):
+        """None values in technical_metrics must render as N/A."""
+        from daily_market_report import html_stock_2330_section
+        stock = self._make_synthetic_stock()
+        stock["technical_metrics"]["ma240"] = None
+        stock["technical_metrics"]["boll"] = None
+        stock["technical_metrics"]["cost_vwap60"] = None
+        html = html_stock_2330_section(stock)
+        self.assertIn("N/A", html)
+
+
 if __name__ == "__main__":
     unittest.main()

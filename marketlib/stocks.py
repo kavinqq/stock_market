@@ -216,7 +216,9 @@ def _find_all_field_indices_substring(fields: list[str], substring: str) -> list
 def _parse_bwibbu_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
     """Parse BWIBBU_d valuation payload for all codes in the given set.
 
-    Returns {code: {pe, pb, dividend_yield}} for each code found in the payload.
+    Returns {code: {pe, pb, dividend_yield, name}} for each code found in the
+    payload.  The "name" field is the live-fetched 證券名稱 and is the primary
+    source of stock names; TW50_NAMES in universe.py is only a fallback.
     Codes not present in the payload are silently skipped.
     Reuses the same header-index helpers and substring targets as _parse_bwibbu.
     """
@@ -233,16 +235,24 @@ def _parse_bwibbu_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
     except ValueError:
         return {}
 
+    # 證券名稱 column is optional — gracefully absent in some fixtures.
+    try:
+        name_idx: int | None = _find_field_index(fields, "證券名稱")
+    except ValueError:
+        name_idx = None
+
     result: dict[str, dict] = {}
     for row in data:
         try:
             code = row[code_idx].strip()
             if code not in codes:
                 continue
+            name = row[name_idx].strip() if name_idx is not None and name_idx < len(row) else ""
             result[code] = {
                 "pe": clean_num(row[pe_idx]),
                 "pb": clean_num(row[pb_idx]),
                 "dividend_yield": clean_num(row[div_idx]),
+                "name": name,
             }
         except (IndexError, ValueError):
             continue
@@ -252,8 +262,11 @@ def _parse_bwibbu_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
 def _parse_t86_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
     """Parse T86 institutional net buy/sell payload for all codes in the given set.
 
-    Returns {code: {foreign_net_lots, trust_net_lots, dealer_net_lots, inst_total_net_lots}}
-    for each code found in the payload. Shares → lots by /1000.
+    Returns {code: {foreign_net_lots, trust_net_lots, dealer_net_lots,
+    inst_total_net_lots, name}} for each code found in the payload.
+    The "name" field is the live-fetched 證券名稱 and is the primary source of
+    stock names; TW50_NAMES in universe.py is only a fallback.
+    Shares → lots by /1000.
     Reuses the same header-index helpers and substring targets as _parse_t86.
     """
     if payload.get("stat") != "OK":
@@ -273,6 +286,12 @@ def _parse_t86_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
     except ValueError:
         return {}
 
+    # 證券名稱 column is optional — gracefully absent in some fixtures.
+    try:
+        name_idx: int | None = _find_field_index(fields, "證券名稱")
+    except ValueError:
+        name_idx = None
+
     result: dict[str, dict] = {}
     for row in data:
         try:
@@ -283,11 +302,13 @@ def _parse_t86_all(payload: dict[str, Any], codes: set) -> dict[str, dict]:
             trust_shares = clean_num(row[trust_idx]) or 0.0
             total_shares = clean_num(row[total_idx]) or 0.0
             dealer_shares = sum(clean_num(row[i]) or 0.0 for i in dealer_indices)
+            name = row[name_idx].strip() if name_idx is not None and name_idx < len(row) else ""
             result[code] = {
                 "foreign_net_lots": foreign_shares / 1000,
                 "trust_net_lots": trust_shares / 1000,
                 "dealer_net_lots": dealer_shares / 1000,
                 "inst_total_net_lots": total_shares / 1000,
+                "name": name,
             }
         except (IndexError, ValueError):
             continue
@@ -320,6 +341,42 @@ def _parse_monthly_revenue_all(items: list[dict[str, Any]], codes: set) -> dict[
         except (KeyError, ValueError, TypeError):
             continue
     return result
+
+
+# ---------------------------------------------------------------------------
+# Name resolution helper
+# ---------------------------------------------------------------------------
+
+
+def resolve_name(code: str, *sources: dict[str, dict]) -> str:
+    """Return the best available display name for a stock code.
+
+    Resolution order:
+    1. First non-empty ``sources[i][code]["name"]`` (live-fetched 證券名稱,
+       from _parse_bwibbu_all / _parse_t86_all — primary source).
+    2. ``TW50_NAMES.get(code)`` — static fallback map; best-effort only.
+    3. The ``code`` string itself — always returns something displayable.
+
+    Args:
+        code: Stock code string (e.g. "2330").
+        *sources: Zero or more dicts keyed by code, each value being a dict
+                  that may contain a "name" key (output of batch parse helpers).
+
+    Returns:
+        A non-empty display string.
+    """
+    from marketlib.universe import TW50_NAMES  # local import avoids circular dependency
+
+    for source in sources:
+        entry = source.get(code)
+        if entry:
+            name = entry.get("name")
+            if name:
+                return name
+    fallback = TW50_NAMES.get(code)
+    if fallback:
+        return fallback
+    return code
 
 
 # ---------------------------------------------------------------------------

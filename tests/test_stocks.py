@@ -449,5 +449,88 @@ class TestBatch(unittest.TestCase):
         self.assertIsNone(tech_raw_score(tiny))
 
 
+class TestNamesAndResolve(unittest.TestCase):
+    """Task 2: name field in batch parsers + resolve_name helper."""
+
+    def _bwibbu_payload(self):
+        return {
+            "stat": "OK",
+            "fields": ["證券代號", "證券名稱", "殖利率(%)", "股利年度", "本益比", "股價淨值比", "財報年/季"],
+            "data": [
+                ["2330", "台積電", "1.8", "2025", "20.5", "5.2", "2025/1"],
+                ["2317", "鴻海", "4.0", "2025", "12.0", "1.5", "2025/1"],
+            ],
+        }
+
+    def _t86_payload(self):
+        return {
+            "stat": "OK",
+            "fields": [
+                "證券代號",
+                "證券名稱",
+                "外陸資買賣超股數(不含外資自營商)",
+                "投信買賣超股數",
+                "自營商買賣超股數",
+                "三大法人買賣超股數",
+            ],
+            "data": [
+                ["2330", "台積電", "5000000", "1000000", "-2000000", "4000000"],
+                ["2317", "鴻海", "2000000", "500000", "300000", "2800000"],
+            ],
+        }
+
+    def test_bwibbu_all_includes_name(self):
+        out = _parse_bwibbu_all(self._bwibbu_payload(), {"2330", "2317"})
+        self.assertEqual(out["2330"]["name"], "台積電")
+        self.assertEqual(out["2317"]["name"], "鴻海")
+
+    def test_bwibbu_all_name_does_not_break_existing_fields(self):
+        out = _parse_bwibbu_all(self._bwibbu_payload(), {"2330"})
+        self.assertEqual(out["2330"]["pe"], 20.5)
+        self.assertEqual(out["2330"]["pb"], 5.2)
+        self.assertEqual(out["2330"]["dividend_yield"], 1.8)
+        self.assertIn("name", out["2330"])
+
+    def test_t86_all_includes_name(self):
+        out = _parse_t86_all(self._t86_payload(), {"2330", "2317"})
+        self.assertEqual(out["2330"]["name"], "台積電")
+        self.assertEqual(out["2317"]["name"], "鴻海")
+
+    def test_t86_all_name_does_not_break_existing_fields(self):
+        out = _parse_t86_all(self._t86_payload(), {"2330"})
+        self.assertEqual(out["2330"]["foreign_net_lots"], 5000.0)
+        self.assertEqual(out["2330"]["inst_total_net_lots"], 4000.0)
+        self.assertIn("name", out["2330"])
+
+    def test_resolve_name_uses_first_live_source(self):
+        from marketlib.stocks import resolve_name
+        live1 = {"2330": {"name": "台積電-live", "pe": 20.0}}
+        live2 = {"2330": {"name": "台積電-live2"}}
+        # First source wins
+        self.assertEqual(resolve_name("2330", live1, live2), "台積電-live")
+
+    def test_resolve_name_falls_back_to_tw50_names(self):
+        from marketlib.stocks import resolve_name
+        empty_source = {}
+        self.assertEqual(resolve_name("2330", empty_source), "台積電")
+
+    def test_resolve_name_falls_back_to_code_when_unknown(self):
+        from marketlib.stocks import resolve_name
+        self.assertEqual(resolve_name("9999"), "9999")
+
+    def test_resolve_name_skips_empty_name_in_source(self):
+        from marketlib.stocks import resolve_name
+        # Source has the code but name is empty string — should skip to TW50_NAMES
+        source_with_empty = {"2330": {"name": ""}}
+        self.assertEqual(resolve_name("2330", source_with_empty), "台積電")
+
+    def test_resolve_name_no_sources(self):
+        from marketlib.stocks import resolve_name
+        # No sources at all — falls back to TW50_NAMES
+        self.assertEqual(resolve_name("2330"), "台積電")
+        # Unknown code with no sources → code itself
+        self.assertEqual(resolve_name("8888"), "8888")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -195,13 +195,22 @@ class TestStockFundamental(unittest.TestCase):
         self.assertIsNone(percentile_rank([], 5))
 
     def test_valuation_pct(self):
+        # Build a history of exactly MIN_VALUATION_HISTORY points so the guard passes.
+        # 60 evenly-spaced values from 10 to 40; value=15 → 2nd out of 5 buckets → ~pct 0.4.
+        # With 60 points: values 10,10.5,...40 → pe=15 sits at roughly the lower 30%.
+        from marketlib.stocks import MIN_VALUATION_HISTORY
+        import statistics
+        # Use 60 values: 12 copies each of [10, 15, 20, 25, 30] to hit exactly 0.4 percentile.
+        repeats = MIN_VALUATION_HISTORY // 5  # 12
+        pe_hist = [10, 15, 20, 25, 30] * repeats  # 60 items
+        pb_hist = [2, 3, 4, 5, 6] * repeats
         out = valuation_metrics(
             {"pe": 15.0, "pb": 3.0, "dividend_yield": 2.0},
-            [10, 15, 20, 25, 30],
-            [2, 3, 4, 5, 6]
+            pe_hist,
+            pb_hist,
         )
         self.assertEqual(out["pe"], 15.0)
-        self.assertAlmostEqual(out["pe_pct"], 0.4)  # 2 of 5 <=15
+        self.assertAlmostEqual(out["pe_pct"], 0.4)  # 2/5 <=15 (24 of 60)
 
 
 class TestScorecard(unittest.TestCase):
@@ -245,6 +254,46 @@ class TestScorecard(unittest.TestCase):
     def test_facet_missing_returns_none(self):
         from marketlib.stocks import valuation_facet
         self.assertIsNone(valuation_facet(None)["score"])
+
+    def test_valuation_metrics_short_history_yields_none_pct(self):
+        """valuation_metrics with < MIN_VALUATION_HISTORY points → pe_pct/pb_pct None."""
+        from marketlib.stocks import valuation_metrics, MIN_VALUATION_HISTORY
+        short_history = list(range(1, MIN_VALUATION_HISTORY))  # 59 points, one short
+        out = valuation_metrics(
+            {"pe": 20.0, "pb": 5.0, "dividend_yield": 1.5},
+            short_history,
+            short_history,
+        )
+        self.assertIsNone(out["pe_pct"], "pe_pct must be None for thin history")
+        self.assertIsNone(out["pb_pct"], "pb_pct must be None for thin history")
+        # Raw values are still passed through
+        self.assertEqual(out["pe"], 20.0)
+        self.assertEqual(out["pb"], 5.0)
+
+    def test_valuation_metrics_long_history_yields_pct(self):
+        """valuation_metrics with >= MIN_VALUATION_HISTORY points → pe_pct computed."""
+        from marketlib.stocks import valuation_metrics, MIN_VALUATION_HISTORY
+        # Use exactly MIN_VALUATION_HISTORY points
+        history = list(range(1, MIN_VALUATION_HISTORY + 1))  # 60 points
+        out = valuation_metrics(
+            {"pe": 30.0, "pb": 3.0, "dividend_yield": 2.0},
+            history,
+            history,
+        )
+        self.assertIsNotNone(out["pe_pct"], "pe_pct must be computed with sufficient history")
+        self.assertIsNotNone(out["pb_pct"])
+
+    def test_valuation_facet_thin_history_score_none_metrics_present(self):
+        """valuation_facet with pe_pct=None (thin history) → score None, metrics still present."""
+        from marketlib.stocks import valuation_facet
+        # Simulate output of valuation_metrics with thin history: pe_pct/pb_pct are None
+        # but raw pe/pb are present.
+        f = valuation_facet({"pe": 20.0, "pb": 5.0, "dividend_yield": 1.5, "pe_pct": None, "pb_pct": None})
+        self.assertIsNone(f["score"], "score must be None when history is insufficient")
+        self.assertIn("估值歷史不足", f["reason"])
+        self.assertIn("pe", f["metrics"])
+        self.assertIn("pb", f["metrics"])
+        self.assertEqual(f["metrics"]["pe"], 20.0)
 
 
 if __name__ == "__main__":

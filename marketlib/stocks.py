@@ -24,6 +24,11 @@ from marketlib.fetchers import (
 
 MONTHLY_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
 
+# Minimum number of PE/PB history points required for a reliable percentile rank.
+# Fewer points → percentile is unreliable (off by a large fraction), so we suppress
+# the bogus cheap/expensive score rather than misleading the user.
+MIN_VALUATION_HISTORY = 60
+
 
 # ---------------------------------------------------------------------------
 # Pure parse helpers (tested directly without network)
@@ -555,8 +560,16 @@ def valuation_metrics(
     pb = current.get("pb")
     dividend_yield = current.get("dividend_yield")
 
-    pe_pct = percentile_rank(pe_history, pe) if pe is not None else None
-    pb_pct = percentile_rank(pb_history, pb) if pb is not None else None
+    # Apply minimum-history guard: percentile rank is unreliable when the history
+    # is too thin (< MIN_VALUATION_HISTORY points).  Set to None so valuation_facet
+    # can detect the "insufficient history" case and suppress a misleading score.
+    pe_pct: Optional[float] = None
+    if pe is not None and len(pe_history) >= MIN_VALUATION_HISTORY:
+        pe_pct = percentile_rank(pe_history, pe)
+
+    pb_pct: Optional[float] = None
+    if pb is not None and len(pb_history) >= MIN_VALUATION_HISTORY:
+        pb_pct = percentile_rank(pb_history, pb)
 
     return {
         "pe": pe,
@@ -794,6 +807,9 @@ def valuation_facet(metrics: Optional[dict[str, Any]]) -> dict[str, Any]:
     pe_pct: percentile rank of current PE vs history (0=cheapest, 1=most expensive).
     Score = (0.5 - pe_pct) * 2, clipped to [-1, 1].
     Cheaper (low pe_pct) → more bullish (positive score).
+
+    When pe_pct is None (insufficient history via valuation_metrics guard),
+    returns score=None with raw PE/PB still in metrics so the UI can show them.
     """
     if not metrics:
         return dict(_MISSING_FACET)
@@ -801,7 +817,21 @@ def valuation_facet(metrics: Optional[dict[str, Any]]) -> dict[str, Any]:
     pe_pct = metrics.get("pe_pct")
     pb_pct = metrics.get("pb_pct")
 
+    # Insufficient history: pe_pct is None despite having a current PE value.
+    # Show raw metrics (pe/pb/dividend_yield) but suppress the bogus score.
     if pe_pct is None and pb_pct is None:
+        # Distinguish "no current data at all" from "thin history"
+        has_raw = metrics.get("pe") is not None or metrics.get("pb") is not None
+        if has_raw:
+            return {
+                "score": None,
+                "reason": "估值歷史不足(需累積更多PE)",
+                "metrics": {
+                    "pe": metrics.get("pe"),
+                    "pb": metrics.get("pb"),
+                    "dividend_yield": metrics.get("dividend_yield"),
+                },
+            }
         return dict(_MISSING_FACET)
 
     scores = []

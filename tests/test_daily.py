@@ -216,5 +216,101 @@ class TestStock2330(unittest.TestCase):
         self.assertIn(r["short_lean"]["bias"], ("偏多", "中性", "偏空"))
 
 
+class TestBuildImprovementLog(unittest.TestCase):
+    """Tests for build_improvement_log: prediction/actual_direction keys and de-dup."""
+
+    def _make_bt(self, misses):
+        """Wrap a list of miss dicts into a backtest-like dict."""
+        return {"recent_misses": misses}
+
+    def _make_archive(self, records):
+        """Wrap a list of records into an archive_eval-like dict."""
+        return {"records": records}
+
+    def test_rows_contain_prediction_and_actual_direction(self):
+        """Each row in improvement_log must have prediction and actual_direction."""
+        from daily_market_report import build_improvement_log
+        tw_bt = self._make_bt([
+            {
+                "target_date": "2026-06-10",
+                "miss_reason": "公式門檻過保守",
+                "prediction": "震盪",
+                "actual_direction": "偏多",
+            }
+        ])
+        us_bt = self._make_bt([])
+        archive = self._make_archive([])
+        rows = build_improvement_log(tw_bt, us_bt, archive)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("prediction", rows[0])
+        self.assertIn("actual_direction", rows[0])
+        self.assertEqual(rows[0]["prediction"], "震盪")
+        self.assertEqual(rows[0]["actual_direction"], "偏多")
+
+    def test_archive_rows_contain_prediction_and_actual_direction(self):
+        """Archive miss records must also carry prediction/actual_direction."""
+        from daily_market_report import build_improvement_log
+        tw_bt = self._make_bt([])
+        us_bt = self._make_bt([])
+        archive = self._make_archive([
+            {
+                "hit": False,
+                "market": "美股",
+                "target_date": "2026-06-05",
+                "miss_reason": "缺少資料源",
+                "prediction": "偏多",
+                "actual_direction": "偏空",
+            }
+        ])
+        rows = build_improvement_log(tw_bt, us_bt, archive)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["prediction"], "偏多")
+        self.assertEqual(rows[0]["actual_direction"], "偏空")
+
+    def test_duplicate_misses_collapse_to_one_row(self):
+        """Identical misses on (market, date, prediction, actual_direction, reason) dedup to one row."""
+        from daily_market_report import build_improvement_log
+        miss = {
+            "target_date": "2026-06-10",
+            "miss_reason": "公式門檻過保守",
+            "prediction": "震盪",
+            "actual_direction": "偏多",
+        }
+        # Same miss appears in both recent_misses (last 5) → should produce one row
+        tw_bt = self._make_bt([miss, miss])
+        us_bt = self._make_bt([])
+        # Also duplicate it in archive
+        archive_miss = {
+            "hit": False,
+            "market": "台股",
+            "target_date": "2026-06-10",
+            "miss_reason": "公式門檻過保守",
+            "prediction": "震盪",
+            "actual_direction": "偏多",
+        }
+        archive = self._make_archive([archive_miss])
+        rows = build_improvement_log(tw_bt, us_bt, archive)
+        # All three map to the same (market=台股, date=2026-06-10, ...) key → 1 row
+        self.assertEqual(len(rows), 1, f"Expected 1 after dedup, got {len(rows)}: {rows}")
+
+    def test_cap_at_12_after_dedup(self):
+        """Result is capped at 12 rows after deduplication."""
+        from daily_market_report import build_improvement_log
+        misses = [
+            {
+                "target_date": f"2026-06-{i:02d}",
+                "miss_reason": "缺少資料源",
+                "prediction": "偏多",
+                "actual_direction": "偏空",
+            }
+            for i in range(1, 20)
+        ]
+        tw_bt = self._make_bt(misses)
+        us_bt = self._make_bt(misses)
+        archive = self._make_archive([])
+        rows = build_improvement_log(tw_bt, us_bt, archive)
+        self.assertLessEqual(len(rows), 12)
+
+
 if __name__ == "__main__":
     unittest.main()

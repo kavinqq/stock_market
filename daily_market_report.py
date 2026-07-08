@@ -894,6 +894,8 @@ def build_improvement_log(
                 {
                     "market": market_name,
                     "date": miss["target_date"],
+                    "prediction": miss.get("prediction"),
+                    "actual_direction": miss.get("actual_direction"),
                     "reason": miss["miss_reason"],
                     "action": "保留供後續調整公式權重或補資料源",
                 }
@@ -903,11 +905,27 @@ def build_improvement_log(
             {
                 "market": miss.get("market", "歷史預測"),
                 "date": miss.get("target_date", "N/A"),
+                "prediction": miss.get("prediction"),
+                "actual_direction": miss.get("actual_direction"),
                 "reason": miss.get("miss_reason", "N/A"),
                 "action": "保留供後續 AI 分析與訓練",
             }
         )
-    return rows[-12:]
+    # De-duplicate on (market, date, prediction, actual_direction, reason)
+    seen: set[tuple] = set()
+    deduped: list[dict[str, str]] = []
+    for row in rows:
+        key = (
+            row.get("market"),
+            row.get("date"),
+            row.get("prediction"),
+            row.get("actual_direction"),
+            row.get("reason"),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(row)
+    return deduped[-12:]
 
 
 def evaluation_record_key(row: dict[str, Any]) -> str:
@@ -2011,15 +2029,17 @@ def build_stock_2330(
 
     # --- T86 institutional chip (best-effort) ---
     t86: Optional[dict[str, Any]] = None
+    t86_date: str = end_iso
     try:
-        _t86_date, t86 = _pick_query_date(daily_bars, _stocks.fetch_t86_for_stock, "2330")
+        t86_date, t86 = _pick_query_date(daily_bars, _stocks.fetch_t86_for_stock, "2330")
     except Exception:  # noqa: BLE001
         pass
 
     # --- Valuation PE/PB (best-effort) ---
     valuation_raw: Optional[dict[str, Any]] = None
+    val_date: str = end_iso
     try:
-        _val_date, valuation_raw = _pick_query_date(
+        val_date, valuation_raw = _pick_query_date(
             daily_bars, _stocks.fetch_valuation_for_stock, "2330"
         )
     except Exception:  # noqa: BLE001
@@ -2045,7 +2065,8 @@ def build_stock_2330(
                 "open": bar.open,
                 "volume": bar.volume,
             }
-            if t86 is not None and bar.date == daily_bars[-1].date:
+            # Attach chip data to the bar whose date matches the resolved chip date
+            if t86 is not None and bar.date == t86_date:
                 row.update({
                     "foreign_net_lots": t86.get("foreign_net_lots"),
                     "trust_net_lots": t86.get("trust_net_lots"),
@@ -2054,11 +2075,11 @@ def build_stock_2330(
                 })
             store.upsert_stock_daily(row)
 
-        # Upsert valuation
+        # Upsert valuation using the date _pick_query_date actually resolved
         if valuation_raw is not None:
             store.upsert_stock_valuation({
                 "stock_no": "2330",
-                "date": end_iso,
+                "date": val_date,
                 "pe": valuation_raw.get("pe"),
                 "pb": valuation_raw.get("pb"),
                 "dividend_yield": valuation_raw.get("dividend_yield"),

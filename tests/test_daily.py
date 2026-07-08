@@ -312,5 +312,26 @@ class TestBuildImprovementLog(unittest.TestCase):
         self.assertLessEqual(len(rows), 12)
 
 
+class TestScreener0050(unittest.TestCase):
+    def test_assemble_ranks(self):
+        codes = ["A", "B"]
+        val = {"A": {"pe": 10, "pb": 1, "dividend_yield": 3}, "B": {"pe": 40, "pb": 8, "dividend_yield": 0.5}}
+        rev = {"A": {"yoy_pct": 30}, "B": {"yoy_pct": -5}}
+        chip = {"A": {"inst_total_net_lots": 5000}, "B": {"inst_total_net_lots": -2000}}
+        tech = {"A": {"tech_raw": 1.0, "ret20": 0.05, "ret60": 0.1}, "B": {"tech_raw": 0.0, "ret20": -0.03, "ret60": -0.05}}
+        from daily_market_report import assemble_screener
+        out = assemble_screener(codes, val, rev, chip, tech)
+        self.assertEqual(out[0]["code"], "A")
+        self.assertEqual(out[0]["rank"], 1)
+
+    def test_missing_revenue_still_ranked(self):
+        codes = ["A", "B"]
+        val = {"A": {"pe": 10, "pb": 1, "dividend_yield": 3}, "B": {"pe": 20, "pb": 2, "dividend_yield": 2}}
+        from daily_market_report import assemble_screener
+        out = assemble_screener(codes, val, {}, {}, {"A": {"tech_raw": 1.0, "ret20": 0.05}, "B": {"tech_raw": 0.0, "ret20": 0.0}})
+        self.assertEqual(len(out), 2)
+        self.assertIsNotNone(out[0]["composite"])
+
+
 if __name__ == "__main__":
     unittest.main()

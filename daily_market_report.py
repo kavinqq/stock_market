@@ -45,6 +45,8 @@ from marketlib import model as ml_model
 from marketlib.features import build_feature_row, decision_time_for, FEATURE_NAMES_TW, FEATURE_NAMES_US
 from marketlib.store import HistoryStore
 from marketlib import stocks as _stocks
+from marketlib import screener as _screener
+from marketlib.universe import TW50_CONSTITUENTS
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import mean
@@ -1283,6 +1285,39 @@ def render_markdown(report: dict[str, Any]) -> str:
         if missing:
             lines.append(f"- 缺少資料：{', '.join(missing)}")
 
+    # --- 0050 潛力股 screener section ---
+    screener = report.get("screener_0050") or []
+    lines.extend(["", "## 0050 潛力股", ""])
+    if not screener:
+        lines.append("- 資料不足，無法顯示 0050 潛力股排名。")
+    else:
+        lines.append("| 名次 | 代號 | 綜合分 | 估值 | 營收 | 技術 | 動能 | 籌碼 | PE | 營收YoY% | 20日報酬 |")
+        lines.append("|------|------|--------|------|------|------|------|------|-----|-----------|---------|")
+        for item in screener[:15]:
+            rank = item.get("rank", "")
+            code = item.get("code", "")
+            composite = item.get("composite")
+            scores = item.get("scores") or {}
+            raw = item.get("raw") or {}
+            composite_str = f"{composite:.3f}" if composite is not None else "N/A"
+            val_str = f"{scores.get('valuation'):.2f}" if scores.get('valuation') is not None else "N/A"
+            rev_str = f"{scores.get('revenue'):.2f}" if scores.get('revenue') is not None else "N/A"
+            tech_str = f"{scores.get('technical'):.2f}" if scores.get('technical') is not None else "N/A"
+            mom_str = f"{scores.get('momentum'):.2f}" if scores.get('momentum') is not None else "N/A"
+            chip_str = f"{scores.get('chip'):.2f}" if scores.get('chip') is not None else "N/A"
+            pe_str = fmt_num(raw.get("pe"), 1)
+            rev_yoy = raw.get("rev_yoy")
+            rev_yoy_str = fmt_pct(rev_yoy / 100 if rev_yoy is not None else None)
+            ret20_str = fmt_pct(raw.get("ret20"))
+            lines.append(
+                f"| {rank} | {code} | {composite_str} | {val_str} | {rev_str} | "
+                f"{tech_str} | {mom_str} | {chip_str} | {pe_str} | {rev_yoy_str} | {ret20_str} |"
+            )
+        lines.append("")
+        lines.append(
+            "> 本表為橫截面基本面+技術面綜合排名啟發式評分，非經驗證的交易訊號，亦不構成任何投資建議。"
+        )
+
     return "\n".join(lines) + "\n"
 
 
@@ -1391,6 +1426,7 @@ def render_html(report: dict[str, Any]) -> str:
     archived_acc = accuracy.get("archived_predictions", {})
     improvement_log = accuracy.get("improvement_log", [])
     stock_2330_section = html_stock_2330_section(report.get("stock_2330"))
+    screener_0050_section = html_screener_0050_section(report.get("screener_0050"))
 
     sectors = (tw.get("sectors") or {}).get("rows") or {}
     sector_rows = "".join(
@@ -1673,6 +1709,7 @@ def render_html(report: dict[str, Any]) -> str:
         <a href="#us">美股</a>
         <a href="#cross">回推</a>
         <a href="#stock2330">台積電 2330</a>
+        <a href="#screener0050">0050 潛力股</a>
         <a href="#sources">資料源</a>
       </nav>
       <div class="meta">
@@ -1844,6 +1881,7 @@ def render_html(report: dict[str, Any]) -> str:
         </div>
       </section>
       {stock_2330_section}
+      {screener_0050_section}
     </main>
   </div>
   <script>
@@ -2147,6 +2185,239 @@ def build_stock_2330(
     return assemble_2330(daily_bars, valuation, revenue_raw, t86, peer, market)
 
 
+# ---------------------------------------------------------------------------
+# 0050 潛力股 screener integration
+# ---------------------------------------------------------------------------
+
+
+def assemble_screener(
+    codes: list[str],
+    valuation_by_code: dict[str, dict],
+    revenue_by_code: dict[str, dict],
+    chip_by_code: dict[str, dict],
+    tech_by_code: dict[str, dict],
+) -> list[dict]:
+    """Pure assembly: map per-code dicts → build_screener records → return ranked list.
+
+    Args:
+        codes: list of stock codes to include.
+        valuation_by_code: {code: {pe, pb, dividend_yield}} (may be empty or missing keys).
+        revenue_by_code:   {code: {yoy_pct, ...}} (may be empty or missing keys).
+        chip_by_code:      {code: {inst_total_net_lots, ...}} (may be empty).
+        tech_by_code:      {code: {tech_raw, ret20, ret60, ...}} (may be empty).
+
+    Returns:
+        Ranked list from build_screener (composite DESC, rank 1 = strongest).
+    """
+    records: list[dict] = []
+    for c in codes:
+        val = valuation_by_code.get(c) or {}
+        rev = revenue_by_code.get(c) or {}
+        chip = chip_by_code.get(c) or {}
+        tech = tech_by_code.get(c) or {}
+        records.append({
+            "code": c,
+            "pe": val.get("pe"),
+            "pb": val.get("pb"),
+            "dividend_yield": val.get("dividend_yield"),
+            "rev_yoy": rev.get("yoy_pct"),
+            "chip_net_lots": chip.get("inst_total_net_lots"),
+            "tech_raw": tech.get("tech_raw"),
+            "ret20": tech.get("ret20"),
+            "ret60": tech.get("ret60"),
+        })
+    return _screener.build_screener(records)
+
+
+def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
+    """Fetch all inputs for TW50 stocks, compute tech metrics, delegate to assemble_screener.
+
+    Batch-fetches valuation, T86 chip, and revenue data ONCE (all-market).
+    Per-code: reads daily history from store cache; fetches from network only
+    when cache is stale or missing.  Adds a short sleep between network STOCK_DAY
+    fetches to be gentle on the TWSE API (~50 stocks).
+
+    Returns ranked screener list or [] on total failure.
+    """
+    codes = TW50_CONSTITUENTS
+    end_iso = end.isoformat()
+
+    # --- Batch fetch: valuation, T86 chip, revenue (ONE request each) ---
+    # For valuation and T86: try latest date, fall back to prior day if empty
+    valuation_by_code: dict[str, dict] = {}
+    chip_by_code: dict[str, dict] = {}
+    try:
+        # Walk back up to 3 days to find a date with data
+        for delta in range(3):
+            try_date = (end - timedelta(days=delta)).isoformat()
+            valuation_by_code = _stocks.fetch_valuation_all(try_date, codes)
+            if valuation_by_code:
+                break
+    except Exception:  # noqa: BLE001
+        valuation_by_code = {}
+
+    try:
+        for delta in range(3):
+            try_date = (end - timedelta(days=delta)).isoformat()
+            chip_by_code = _stocks.fetch_t86_all(try_date, codes)
+            if chip_by_code:
+                break
+    except Exception:  # noqa: BLE001
+        chip_by_code = {}
+
+    revenue_by_code: dict[str, dict] = {}
+    try:
+        revenue_by_code = _stocks.fetch_monthly_revenue_all(codes)
+    except Exception:  # noqa: BLE001
+        revenue_by_code = {}
+
+    # --- Per-code: history from store cache; fetch+upsert if stale/missing ---
+    tech_by_code: dict[str, dict] = {}
+    # Freshness: bars must include the last 20 days before `end`
+    stale_threshold = (end - timedelta(days=20)).isoformat()
+
+    for code in codes:
+        try:
+            cached_rows = store.get_stock_daily(code)
+            # Decide if cache is fresh enough (last row within 20 days of end)
+            need_fetch = (
+                not cached_rows
+                or cached_rows[-1]["date"] < stale_threshold
+            )
+
+            daily_bars: list = []
+            if need_fetch:
+                time.sleep(0.6)
+                fetched_bars = _stocks.fetch_stock_history(code, end, lookback_months=5)
+                if fetched_bars:
+                    for bar in fetched_bars:
+                        store.upsert_stock_daily({
+                            "stock_no": code,
+                            "date": bar.date,
+                            "close": bar.close,
+                            "high": bar.high,
+                            "low": bar.low,
+                            "open": bar.open,
+                            "volume": bar.volume,
+                        })
+                    daily_bars = fetched_bars
+                else:
+                    # Fall back to whatever is in the store
+                    from marketlib.core import MarketBar
+                    daily_bars = [
+                        MarketBar(
+                            date=r["date"],
+                            close=r["close"],
+                            high=r.get("high"),
+                            low=r.get("low"),
+                            open=r.get("open"),
+                            volume=r.get("volume"),
+                        )
+                        for r in cached_rows if r.get("close") is not None
+                    ]
+            else:
+                from marketlib.core import MarketBar
+                daily_bars = [
+                    MarketBar(
+                        date=r["date"],
+                        close=r["close"],
+                        high=r.get("high"),
+                        low=r.get("low"),
+                        open=r.get("open"),
+                        volume=r.get("volume"),
+                    )
+                    for r in cached_rows if r.get("close") is not None
+                ]
+
+            if daily_bars:
+                tech_raw = _stocks.tech_raw_score(daily_bars)
+                tech_m = _stocks.technical_metrics(daily_bars)
+                tech_by_code[code] = {
+                    "tech_raw": tech_raw,
+                    "ret20": tech_m.get("ret20"),
+                    "ret60": tech_m.get("ret60"),
+                }
+        except Exception:  # noqa: BLE001
+            # One failure never aborts the whole screener
+            pass
+
+    return assemble_screener(codes, valuation_by_code, revenue_by_code, chip_by_code, tech_by_code)
+
+
+def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
+    """Render the 0050 潛力股 screener HTML section."""
+    disclaimer = (
+        "本頁為橫截面基本面+技術面綜合排名啟發式評分，非經驗證的交易訊號，亦不構成任何投資建議。"
+        " 排名僅反映當期各股相對強弱，不代表絕對報酬預測。"
+    )
+
+    if not screener_data:
+        return (
+            '<section id="screener0050" class="page">'
+            '<div class="hero"><h1>0050 潛力股</h1></div>'
+            '<div class="panel"><h2>資料不足</h2>'
+            f'<p class="subtle">{esc(disclaimer)}</p></div>'
+            '</section>'
+        )
+
+    rows_html = ""
+    for item in screener_data:
+        rank = item.get("rank", "")
+        code = item.get("code", "")
+        composite = item.get("composite")
+        scores = item.get("scores") or {}
+        raw = item.get("raw") or {}
+
+        composite_str = f"{composite:.3f}" if composite is not None else "N/A"
+        val_str = f"{scores.get('valuation'):.2f}" if scores.get('valuation') is not None else "N/A"
+        rev_str = f"{scores.get('revenue'):.2f}" if scores.get('revenue') is not None else "N/A"
+        tech_str = f"{scores.get('technical'):.2f}" if scores.get('technical') is not None else "N/A"
+        mom_str = f"{scores.get('momentum'):.2f}" if scores.get('momentum') is not None else "N/A"
+        chip_str = f"{scores.get('chip'):.2f}" if scores.get('chip') is not None else "N/A"
+        pe_str = fmt_num(raw.get("pe"), 1)
+        rev_yoy_str = fmt_pct(raw.get("rev_yoy") / 100 if raw.get("rev_yoy") is not None else None)
+        ret20_str = fmt_pct(raw.get("ret20"))
+
+        rows_html += (
+            "<tr>"
+            f"<td>{esc(str(rank))}</td>"
+            f"<td>{esc(code)}</td>"
+            f"<td><strong>{esc(composite_str)}</strong></td>"
+            f"<td>{esc(val_str)}</td>"
+            f"<td>{esc(rev_str)}</td>"
+            f"<td>{esc(tech_str)}</td>"
+            f"<td>{esc(mom_str)}</td>"
+            f"<td>{esc(chip_str)}</td>"
+            f"<td>{esc(pe_str)}</td>"
+            f"<td>{esc(rev_yoy_str)}</td>"
+            f"<td>{esc(ret20_str)}</td>"
+            "</tr>"
+        )
+
+    return (
+        '<section id="screener0050" class="page">'
+        '<div class="hero">'
+        '<h1>0050 潛力股</h1>'
+        '<div class="subtle">台灣50成分股橫截面多因子排名：估值 / 營收 / 技術 / 動能 / 籌碼。</div>'
+        '</div>'
+        '<div class="panel">'
+        '<h2>綜合排名</h2>'
+        '<div style="overflow-x:auto">'
+        '<table>'
+        '<thead><tr>'
+        '<th>名次</th><th>代號</th><th>綜合分</th>'
+        '<th>估值</th><th>營收</th><th>技術</th><th>動能</th><th>籌碼</th>'
+        '<th>PE</th><th>營收YoY%</th><th>20日報酬</th>'
+        '</tr></thead>'
+        f'<tbody>{rows_html}</tbody>'
+        '</table>'
+        '</div>'
+        f'<p class="subtle">{esc(disclaimer)}</p>'
+        '</div>'
+        '</section>'
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate daily US/Taiwan market report.")
     parser.add_argument(
@@ -2218,6 +2489,12 @@ def main() -> int:
             report["stock_2330"] = build_stock_2330(us, taiwan, report_date, store)
         except Exception as exc:  # noqa: BLE001
             report["stock_2330"] = {"error": str(exc)}
+
+        # 0050 screener (best-effort; never aborts index report)
+        try:
+            report["screener_0050"] = build_screener_0050(report_date, store)
+        except Exception as exc:  # noqa: BLE001
+            report["screener_0050"] = []
     finally:
         store.close()
 

@@ -13,15 +13,8 @@
        model. Requires sklearn -> uses the project .venv, NOT /usr/bin/python3. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/kuanlin/stock_market/.venv/bin/python</string>
-    <string>/Users/kuanlin/stock_market/train.py</string>
-    <string>--market</string>
-    <string>tw</string>
-    <string>--out</string>
-    <string>/Users/kuanlin/stock_market/models/candidate_auto</string>
-    <string>--promote-if-passes</string>
-    <string>--promote-dir</string>
-    <string>/Users/kuanlin/stock_market/models</string>
+    <string>/bin/bash</string>
+    <string>/Users/kuanlin/stock_market/self_tune.sh</string>
   </array>
 
   <key>WorkingDirectory</key>

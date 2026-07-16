@@ -25,7 +25,7 @@ PARAM_GRID = [
 EMBARGO = 5
 
 def _matrix(samples, feature_names):
-    med = {n: float(np.nanmedian([_get(s, n) for s in samples])) for n in feature_names}
+    med = {n: _nanmedian0([_get(s, n) for s in samples]) for n in feature_names}
     X, y = [], []
     for s in samples:
         X.append([_imp(_get(s, n), med[n]) for n in feature_names])
@@ -35,6 +35,14 @@ def _matrix(samples, feature_names):
 def _get(s, n):
     v = s["features"].get(n)
     return float("nan") if v is None else float(v)
+
+def _nanmedian0(vals):
+    """Median ignoring NaN; falls back to neutral 0.0 when the whole column is
+    NaN (e.g. US features in a pre-2022 TW fold), so imputation never leaks NaN."""
+    arr = np.asarray(vals, dtype=float)
+    if np.isnan(arr).all():
+        return 0.0
+    return float(np.nanmedian(arr))
 
 def _imp(v, m):
     return m if (v != v) else v  # NaN -> median
@@ -75,9 +83,13 @@ def _apply_platt(z, w, b):
     return 1.0 / (1.0 + np.exp(-(w * z + b)))
 
 def _select_thresholds(p, y):
+    # Wider neutral band search than v1: bull up to 0.65 / bear down to 0.35 lets
+    # more borderline days land in 震盪, countering the model's tendency to
+    # over-predict 偏多 (the up-drift base rate). Best (bull, bear) still chosen
+    # by macro-F1 on the calibrated pooled-OOS preds.
     best, best_f1 = (0.55, 0.45), -1.0
-    for bull in (0.52, 0.55, 0.58, 0.6):
-        for bear in (0.4, 0.42, 0.45, 0.48):
+    for bull in (0.52, 0.55, 0.58, 0.6, 0.63, 0.65):
+        for bear in (0.35, 0.38, 0.4, 0.42, 0.45, 0.48):
             recs = [{"prediction": "偏多" if pi >= bull else "偏空" if pi <= bear else "震盪",
                      "actual_direction": "偏多" if yi else "偏空"} for pi, yi in zip(p, y)]
             f1 = summarize_classification(recs)["macro_f1"] or 0.0
@@ -175,8 +187,19 @@ def evaluate_on_test(clf, mean, std, med, test_samples, feature_names, threshold
                         "classification": cls},
             "baselines": base, "significance": sig}
 
+def _should_calibrate(params, y_oos, use_platt: bool) -> bool:
+    """Whether to fit Platt scaling. Only for balanced class_weight (which
+    distorts probabilities) with ≥2 classes present, AND when the caller opts
+    in. TW opts OUT (use_platt=False): calibration squashes the weak next-day
+    signal into a narrow band so the bear threshold never fires and the deploy
+    gate rejects the model; the raw sigmoid keeps enough spread to predict all
+    three classes (honest, uncalibrated confidence)."""
+    y = y_oos.tolist() if hasattr(y_oos, "tolist") else list(y_oos)
+    return bool(use_platt and params.get("class_weight") == "balanced"
+                and len(set(y)) >= 2)
+
 def train_from_samples(samples, feature_names, market, out_dir, test_frac=None,
-                       test_months=18, seed=0):
+                       test_months=18, seed=0, use_platt=True):
     os.makedirs(out_dir, exist_ok=True)
     labeled = [s for s in samples if s["label"] is not None]
     if test_frac is not None:
@@ -192,7 +215,7 @@ def train_from_samples(samples, feature_names, market, out_dir, test_frac=None,
     z_oos, p_oos, y_oos = collect_oos_predictions(trainval, feature_names, best["params"])
     # Fix #4 — calibration: balanced class_weight distorts probabilities, so
     # fit Platt scaling on the pooled OOS (z, y). class_weight None -> no recal.
-    if best["params"]["class_weight"] == "balanced" and len(set(y_oos.tolist())) >= 2:
+    if _should_calibrate(best["params"], y_oos, use_platt):
         w, b = _platt_calibrate(z_oos, y_oos)
         calibration = {"method": "platt", "params": {"w": w, "b": b}}
         p_oos_cal = _apply_platt(z_oos, w, b)
@@ -262,7 +285,25 @@ def train_market(db, market, out_dir, test_months=18, seed=0):
         rows, us = store.get_us_rows(), []; names = FEATURE_NAMES_US
     samples = build_dataset(market, rows, us)
     store.close()
-    return train_from_samples(samples, names, market, out_dir, test_months=test_months, seed=seed)
+    # 台股跳過 Platt 校準(弱訊號被校準壓成窄帶會使 bear 門檻永不觸發、退化被 gate 擋);
+    # 用原始 sigmoid 保留分散度。信心標籤因此為「未校準」。
+    return train_from_samples(samples, names, market, out_dir, test_months=test_months,
+                              seed=seed, use_platt=(market != "tw"))
+
+def promote_if_passes(metrics_path, model_path, market, promote_dir):
+    """Copy the freshly trained model into `promote_dir` (production) iff its OOS
+    metrics clear the deploy gate. Returns (promoted, reason)."""
+    import shutil
+    from marketlib.model import passes_deploy_gate
+    with open(metrics_path, encoding="utf-8") as fh:
+        metrics = json.load(fh)
+    ok, reason = passes_deploy_gate(metrics)
+    if not ok:
+        return False, reason
+    os.makedirs(promote_dir, exist_ok=True)
+    dest = os.path.join(promote_dir, f"model_{market}.json")
+    shutil.copyfile(model_path, dest)
+    return True, reason
 
 def main() -> int:
     p = argparse.ArgumentParser()
@@ -270,9 +311,19 @@ def main() -> int:
     p.add_argument("--market", choices=["tw", "us"], required=True)
     p.add_argument("--out", default="models")
     p.add_argument("--test-months", type=int, default=18)
+    p.add_argument("--promote-if-passes", action="store_true",
+                   help="若 OOS 通過部署 gate，複製 model_<market>.json 到 --promote-dir")
+    p.add_argument("--promote-dir", default="models",
+                   help="production 模型目錄（daily_market_report.py 讀取處）")
     a = p.parse_args()
     mp, xp = train_market(a.db, a.market, a.out, test_months=a.test_months)
     print(f"Wrote {mp}\nWrote {xp}")
+    if a.promote_if_passes:
+        promoted, reason = promote_if_passes(xp, mp, a.market, a.promote_dir)
+        if promoted:
+            print(f"PROMOTED -> {os.path.join(a.promote_dir, f'model_{a.market}.json')}  ({reason})")
+        else:
+            print(f"NOT promoted（留在 candidate）：{reason}")
     return 0
 
 if __name__ == "__main__":

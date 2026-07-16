@@ -37,7 +37,9 @@ from marketlib.fetchers import (
     fetch_nasdaq_history,
     fetch_vix_history,
     fetch_finra_margin_statistics,
+    fetch_taifex_inst_futures,
     twse_asof,
+    taifex_asof,
     us_price_asof,
     vix_asof,
 )
@@ -158,6 +160,11 @@ def build_taiwan_report(end: date, lookback_months: int) -> dict[str, Any]:
     institutional = fetch_twse_institutional(latest_date)
     summary = fetch_twse_summary(latest_date)
     sectors = fetch_twse_sector_indices(latest_date)
+    try:
+        taifex = (fetch_taifex_inst_futures(latest_date) or {}).get(latest_date)
+    except Exception as exc:  # 期貨為輔助訊號,抓取失敗不應中斷整份報告
+        print(f"[taiwan] TAIFEX fetch error on {latest_date}: {exc}", file=sys.stderr)
+        taifex = None
     return {
         "latest_date": latest_date,
         "bars": [asdict(bar) for bar in bars],
@@ -165,6 +172,7 @@ def build_taiwan_report(end: date, lookback_months: int) -> dict[str, Any]:
         "margin": margin,
         "institutional": institutional,
         "summary": summary,
+        "taifex": taifex,
         "sectors": sectors,
         "volume_price_label": classify_volume_price(
             indicators.day_change_pct,
@@ -558,9 +566,11 @@ def build_us_prediction(us: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_predictions(report: dict[str, Any]) -> dict[str, Any]:
+    # US output was dropped (focus on TW). US data (report["us"]) is still fetched
+    # and passed into the TW prediction as an input signal — see build_taiwan_prediction
+    # and the us_* model features. build_us_prediction() is retained but no longer called.
     return {
         "taiwan": build_taiwan_prediction(report["taiwan"], report["us"]),
-        "us": build_us_prediction(report["us"]),
     }
 
 
@@ -589,6 +599,7 @@ def model_prediction(market: str, model_path: str, rows: list, us_rows: list) ->
     return {"bias": ml_model.proba_to_direction(model, p),
             "probability": round(p, 4),
             "confidence": ml_model.proba_to_confidence(model, p),
+            "confidence_calibrated": (model.get("calibration") or {}).get("method") == "platt",
             "model_version": model.get("trained_at", "unknown")}
 
 
@@ -615,11 +626,15 @@ def upsert_report_into_store(report: dict[str, Any], store: HistoryStore) -> Non
         net = (institutional.get("rows", {}).get("合計") or {}).get("net_ntd")
         up = (breadth.get("上漲") or {}).get("stocks")
         down = (breadth.get("下跌") or {}).get("stocks")
+        taifex = tw.get("taifex") or {}
+        tx_foreign = taifex.get("tx_foreign_oi_net_lots")
+        tx_inst = taifex.get("tx_inst_oi_net_lots")
 
         price_asof = twse_asof(tw_date, "price")
         inst_asof = twse_asof(tw_date, "inst") if net is not None else None
         margin_asof = twse_asof(tw_date, "margin") if financing else None
         breadth_asof = twse_asof(tw_date, "breadth") if up is not None else None
+        taifex_asof_val = taifex_asof(tw_date) if tx_foreign is not None else None
 
         missing = [k for k, v in (("inst", net), ("margin", financing or None),
                                   ("breadth", up)) if v is None]
@@ -634,11 +649,15 @@ def upsert_report_into_store(report: dict[str, Any], store: HistoryStore) -> Non
             "margin_balance_change_ntd": financing.get("balance_change_ntd"),
             "adv_count": up,
             "dec_count": down,
+            "tx_foreign_oi_net_lots": tx_foreign,
+            "tx_inst_oi_net_lots": tx_inst,
             "price_asof_taipei": price_asof,
             "inst_asof_taipei": inst_asof,
             "margin_asof_taipei": margin_asof,
             "breadth_asof_taipei": breadth_asof,
-            "available_at_taipei": _max_asof(price_asof, inst_asof, margin_asof, breadth_asof),
+            "taifex_asof_taipei": taifex_asof_val,
+            "available_at_taipei": _max_asof(price_asof, inst_asof, margin_asof,
+                                             breadth_asof, taifex_asof_val),
             "missing_fields": ",".join(missing) if missing else None,
         })
 
@@ -788,15 +807,16 @@ def rolling_backtest(bars: list[dict[str, Any]], volume_attr: str, sample_size: 
 
 
 def build_accuracy_report(report: dict[str, Any], data_dir: Path) -> dict[str, Any]:
+    # US dropped from output. TW-only price/volume diagnostic backtest + archived
+    # prediction eval. build_improvement_log still takes a US backtest slot; we
+    # pass an empty one so no US misses appear in the improvement log.
     taiwan_bt = rolling_backtest(report["taiwan"]["bars"], "turnover")
-    us_bt = rolling_backtest(report["us"]["series"]["SPY"]["bars"], "volume")
     archive_eval = evaluate_archived_predictions(report, data_dir)
     return {
         "formula_version": "rule-v1.1",
         "taiwan": taiwan_bt,
-        "us": us_bt,
         "archived_predictions": archive_eval,
-        "improvement_log": build_improvement_log(taiwan_bt, us_bt, archive_eval),
+        "improvement_log": build_improvement_log(taiwan_bt, {}, archive_eval),
     }
 
 
@@ -813,11 +833,13 @@ def evaluate_archived_predictions(report: dict[str, Any], data_dir: Path) -> dic
     if not data_dir.exists():
         return {"sample_size": 0, "hit_rate": None, "records": [], "limitations": ["尚無歷史 JSON 報告"]}
 
+    # US dropped from output: only re-evaluate TW archived predictions. Historical
+    # US rows already in evaluation_history.json are preserved by the idempotent
+    # merge in update_evaluation_history (they are never in current_records to
+    # overwrite, and existing rows are kept).
     current_maps = {
         "taiwan": market_bars_by_date(report, "taiwan"),
-        "us": market_bars_by_date(report, "us"),
     }
-    current_dates = set(current_maps["taiwan"]) | set(current_maps["us"])
     for path in sorted(data_dir.glob("*.json")):
         if path.name == "latest.json":
             continue
@@ -828,7 +850,7 @@ def evaluate_archived_predictions(report: dict[str, Any], data_dir: Path) -> dic
         predictions = old.get("predictions")
         if not predictions:
             continue
-        for key in ("taiwan", "us"):
+        for key in ("taiwan",):
             pred = predictions.get(key)
             if not pred:
                 continue
@@ -1193,31 +1215,26 @@ def render_markdown(report: dict[str, Any]) -> str:
     qqq = IndicatorSet(**us["series"]["QQQ"]["indicators"])
     predictions = report.get("predictions", {})
     tw_pred = predictions.get("taiwan", {})
-    us_pred = predictions.get("us", {})
     accuracy = report.get("accuracy", {})
     tw_acc = accuracy.get("taiwan", {})
-    us_acc = accuracy.get("us", {})
     archived_acc = accuracy.get("archived_predictions", {})
 
     tw_levels = support_resistance_from_bars(tw["bars"])
-    spy_levels = support_resistance_from_bars(us["series"]["SPY"]["bars"])
-    qqq_levels = support_resistance_from_bars(us["series"]["QQQ"]["bars"])
 
     lines = [
-        f"# 台美股大盤日報 - {report['report_date']}",
+        f"# 台股大盤日報 - {report['report_date']}",
         "",
         f"產生時間：{generated}",
         "",
         "## 資料日期",
         "",
         f"- 台股：{tw['latest_date']}（TWSE）",
-        f"- 美股：{us['latest_date']}（Nasdaq API / Cboe VIX）",
-        "- 美股融資：FINRA 月資料，通常次月第三週更新",
+        f"- 美股（僅作台股輸入訊號）：{us['latest_date']}（Nasdaq API / Cboe VIX）",
         "",
         "## 總結",
         "",
         f"- 台股：{tw_ind.trend_label}，{tw['volume_price_label']}，{tw['leverage_label']}。",
-        f"- 美股：SPY {spy.trend_label}，QQQ {qqq.trend_label}，{us['volume_price_label']}，{us['vix']['label']}。",
+        f"- 隔夜美股脈絡：SPY {spy.trend_label}，QQQ {qqq.trend_label}，{us['vix']['label']}。",
         f"- 回推：{infer_cross_market(tw, us)[0]}",
         "",
         "## 台股大盤",
@@ -1237,15 +1254,6 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## 美股大盤",
-            "",
-        ]
-    )
-    lines.extend(f"- {line}" for line in summarize_us(us))
-
-    lines.extend(
-        [
-            "",
             "## 下一交易日走勢預測",
             "",
             (
@@ -1256,17 +1264,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{fmt_pct((tw_pred.get('expected_range_pct') or {}).get('high_pct'))}；"
                 f"實際震盪帶 {fmt_neutral_threshold(tw_pred.get('neutral_threshold_pct'))}。"
             ),
-            (
-                f"- 美股：{us_pred.get('target_date_estimate', 'N/A')} "
-                f"{us_pred.get('bias', 'N/A')}，信心 {us_pred.get('confidence', 'N/A')}，"
-                f"分數 {us_pred.get('score', 'N/A')}，預估區間 "
-                f"{fmt_pct((us_pred.get('expected_range_pct') or {}).get('low_pct'))} ~ "
-                f"{fmt_pct((us_pred.get('expected_range_pct') or {}).get('high_pct'))}；"
-                f"實際震盪帶 {fmt_neutral_threshold(us_pred.get('neutral_threshold_pct'))}。"
-            ),
             "- 台股理由：" + "；".join(tw_pred.get("reasons", [])[:4]),
-            "- 美股理由：" + "；".join(us_pred.get("reasons", [])[:4]),
-            "- 預測限制：" + "；".join((tw_pred.get("missing_data", []) + us_pred.get("missing_data", []))[:5]),
+            "- 預測限制：" + "；".join(tw_pred.get("missing_data", [])[:5]),
             "",
             "## 準確率追蹤",
             "",
@@ -1275,12 +1274,6 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"模型 {fmt_pct(tw_acc.get('hit_rate'), signed=False)}，"
                 f"{accuracy_baseline_note(tw_acc)}，"
                 f"macro-F1 {fmt_pct(accuracy_macro_f1(tw_acc), signed=False)}。"
-            ),
-            (
-                f"- 美股價量診斷回測：樣本 {us_acc.get('sample_size', 0)}，"
-                f"模型 {fmt_pct(us_acc.get('hit_rate'), signed=False)}，"
-                f"{accuracy_baseline_note(us_acc)}，"
-                f"macro-F1 {fmt_pct(accuracy_macro_f1(us_acc), signed=False)}。"
             ),
             (
                 f"- 正式每日預測驗證：樣本 {archived_acc.get('sample_size', 0)}，"
@@ -1302,7 +1295,6 @@ def render_markdown(report: dict[str, Any]) -> str:
         [
             "- 價格跌破 20 日線且放量，優先視為供給壓力；若隔日縮量止跌，才改看整理。",
             "- 融資增加搭配下跌，通常代表槓桿尚未洗乾淨；融資減少搭配下跌，則是去槓桿正在發生。",
-            "- 美股 margin debt 是月資料，不適合判斷單日轉折，適合判斷槓桿背景溫度。",
             "",
             "## 觀察價位",
             "",
@@ -1311,25 +1303,13 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"20日區間壓力 {fmt_num(tw_levels['resistance_20d'], 2)}，"
                 f"20日線 {fmt_num(tw_ind.ma20, 2)}，60日線 {fmt_num(tw_ind.ma60, 2)}。"
             ),
-            (
-                f"- SPY：20日區間支撐 {fmt_num(spy_levels['support_20d'], 2)}，"
-                f"20日區間壓力 {fmt_num(spy_levels['resistance_20d'], 2)}，"
-                f"20日線 {fmt_num(spy.ma20, 2)}，60日線 {fmt_num(spy.ma60, 2)}。"
-            ),
-            (
-                f"- QQQ：20日區間支撐 {fmt_num(qqq_levels['support_20d'], 2)}，"
-                f"20日區間壓力 {fmt_num(qqq_levels['resistance_20d'], 2)}，"
-                f"20日線 {fmt_num(qqq.ma20, 2)}，60日線 {fmt_num(qqq.ma60, 2)}。"
-            ),
             "",
             "## 資料源",
             "",
             "- TWSE FMTQIK：台股每日成交資訊",
             "- TWSE MI_MARGN：上市信用交易統計",
             "- TWSE BFI82U：三大法人買賣金額統計",
-            "- Nasdaq historical API：SPY / QQQ / IWM / COMP 價量資料",
-            "- Cboe VIX History：VIX 日資料",
-            "- FINRA Margin Statistics：美股 margin debt 月資料",
+            "- Nasdaq historical API + Cboe VIX：SPY / QQQ / VIX，僅作台股模型輸入特徵",
             "",
             "註：這是規則式市場分析，不是投資建議。",
         ]
@@ -1492,28 +1472,24 @@ def html_miss_rows(rows: list[dict[str, Any]]) -> str:
 
 
 def render_html(report: dict[str, Any]) -> str:
+    # US output removed (TW focus). US data (spy/qqq/vix) is kept only as overnight
+    # context in the overview + as TW model input features — no US page/prediction.
     tw = report["taiwan"]
     us = report["us"]
     tw_ind = IndicatorSet(**tw["indicators"])
     spy = IndicatorSet(**us["series"]["SPY"]["indicators"])
     qqq = IndicatorSet(**us["series"]["QQQ"]["indicators"])
-    iwm = IndicatorSet(**us["series"]["IWM"]["indicators"])
     tw_levels = support_resistance_from_bars(tw["bars"])
-    spy_levels = support_resistance_from_bars(us["series"]["SPY"]["bars"])
-    qqq_levels = support_resistance_from_bars(us["series"]["QQQ"]["bars"])
     financing = ((tw.get("margin") or {}).get("margin_financing") or {})
     institutional = tw.get("institutional")
     foreign_net = twse_net_by_name(institutional, "外資及陸資(不含外資自營商)")
     trust_net = twse_net_by_name(institutional, "投信")
     total_net = twse_net_by_name(institutional, "合計")
-    finra_latest = ((us.get("finra_margin") or {}).get("latest") or {})
     cross_lines = infer_cross_market(tw, us)
     predictions = report.get("predictions", {})
     tw_pred = predictions.get("taiwan", {})
-    us_pred = predictions.get("us", {})
     accuracy = report.get("accuracy", {})
     tw_acc = accuracy.get("taiwan", {})
-    us_acc = accuracy.get("us", {})
     archived_acc = accuracy.get("archived_predictions", {})
     improvement_log = accuracy.get("improvement_log", [])
     stock_2330_section = html_stock_2330_section(report.get("stock_2330"))
@@ -1541,7 +1517,7 @@ def render_html(report: dict[str, Any]) -> str:
             metric_card(
                 "籌碼面",
                 "有",
-                "台股融資/融券、三大法人；美股 FINRA margin debt",
+                "台股融資/融券、三大法人",
                 "good",
             ),
             metric_card(
@@ -1597,14 +1573,6 @@ def render_html(report: dict[str, Any]) -> str:
         ]
     )
 
-    us_cards = "".join(
-        [
-            metric_card("SPY", fmt_num(spy.close, 2), f"20日 {fmt_pct(spy.twenty_day_pct)}", "neutral"),
-            metric_card("QQQ", fmt_num(qqq.close, 2), f"20日 {fmt_pct(qqq.twenty_day_pct)}", "neutral"),
-            metric_card("IWM", fmt_num(iwm.close, 2), f"20日 {fmt_pct(iwm.twenty_day_pct)}", "neutral"),
-            metric_card("FINRA 融資", fmt_big_usd_millions(finra_latest.get("debit_balances_millions")), f"{finra_latest.get('month', 'N/A')} / 月變動 {fmt_pct(finra_latest.get('mom_debit_pct'))}", "warn"),
-        ]
-    )
     prediction_cards = "".join(
         [
             metric_card(
@@ -1619,18 +1587,6 @@ def render_html(report: dict[str, Any]) -> str:
                 fmt_prediction_range(tw_pred),
                 "warn",
             ),
-            metric_card(
-                "美股下次開盤",
-                str(us_pred.get("bias", "N/A")),
-                f"{us_pred.get('target_date_estimate', 'N/A')} / 信心 {us_pred.get('confidence', 'N/A')}",
-                prediction_tone(us_pred.get("bias", "")),
-            ),
-            metric_card(
-                "美股分數",
-                str(us_pred.get("score", "N/A")),
-                fmt_prediction_range(us_pred),
-                "warn",
-            ),
         ]
     )
     accuracy_cards = "".join(
@@ -1639,12 +1595,6 @@ def render_html(report: dict[str, Any]) -> str:
                 "台股價量診斷",
                 fmt_pct(tw_acc.get("hit_rate"), signed=False),
                 f"樣本 {tw_acc.get('sample_size', 0)} / {accuracy_baseline_note(tw_acc)}",
-                "neutral",
-            ),
-            metric_card(
-                "美股價量診斷",
-                fmt_pct(us_acc.get("hit_rate"), signed=False),
-                f"樣本 {us_acc.get('sample_size', 0)} / {accuracy_baseline_note(us_acc)}",
                 "neutral",
             ),
             metric_card(
@@ -1673,7 +1623,7 @@ def render_html(report: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>台美股大盤日報 - {esc(report['report_date'])}</title>
+  <title>台股大盤日報 - {esc(report['report_date'])}</title>
   <style>
     :root {{
       --ink: #18212f;
@@ -1790,14 +1740,13 @@ def render_html(report: dict[str, Any]) -> str:
     <aside class="sidebar">
       <div class="brand">
         <small>Daily Market Desk</small>
-        <strong>台美股大盤日報</strong>
+        <strong>台股大盤日報</strong>
       </div>
       <nav class="nav" aria-label="report pages">
         <a href="#overview" class="active">總覽</a>
         <a href="#prediction">預測</a>
         <a href="#accuracy">準確率</a>
         <a href="#taiwan">台股</a>
-        <a href="#us">美股</a>
         <a href="#cross">回推</a>
         <a href="#stock2330">台積電 2330</a>
         <a href="#screener0050">0050 潛力股</a>
@@ -1811,8 +1760,8 @@ def render_html(report: dict[str, Any]) -> str:
     <main>
       <section id="overview" class="page active">
         <div class="hero">
-          <h1>台美股大盤日報</h1>
-          <div class="subtle">台股資料日 {esc(tw['latest_date'])}；美股資料日 {esc(us['latest_date'])}</div>
+          <h1>台股大盤日報</h1>
+          <div class="subtle">台股資料日 {esc(tw['latest_date'])}（隔夜美股 {esc(us['latest_date'])} 僅作台股輸入訊號）</div>
           <div class="stamp"><span>技術</span><span>量價</span><span>籌碼</span><span>風險</span><span>基本面未納入</span></div>
         </div>
         <div class="grid">{overview_cards}</div>
@@ -1824,7 +1773,7 @@ def render_html(report: dict[str, Any]) -> str:
           <h2>當日結論</h2>
           {bullet_list([
               f"台股：{tw_ind.trend_label}，{tw['volume_price_label']}，{tw['leverage_label']}。",
-              f"美股：SPY {spy.trend_label}，QQQ {qqq.trend_label}，{us['volume_price_label']}，{us['vix']['label']}。",
+              f"隔夜美股脈絡：SPY {spy.trend_label}，QQQ {qqq.trend_label}，{us['vix']['label']}。",
               f"回推：{cross_lines[0]}",
           ])}
         </div>
@@ -1837,7 +1786,6 @@ def render_html(report: dict[str, Any]) -> str:
         </div>
         <div class="grid">{prediction_cards}</div>
         {html_prediction_block(tw_pred)}
-        {html_prediction_block(us_pred)}
       </section>
 
       <section id="accuracy" class="page">
@@ -1858,7 +1806,6 @@ def render_html(report: dict[str, Any]) -> str:
           <h2>Baseline 對照</h2>
           {bullet_list([
               f"台股價量診斷：模型 {fmt_pct(tw_acc.get('hit_rate'), signed=False)}；{accuracy_baseline_note(tw_acc)}；macro-F1 {fmt_pct(accuracy_macro_f1(tw_acc), signed=False)}。",
-              f"美股價量診斷：模型 {fmt_pct(us_acc.get('hit_rate'), signed=False)}；{accuracy_baseline_note(us_acc)}；macro-F1 {fmt_pct(accuracy_macro_f1(us_acc), signed=False)}。",
               "若模型長期贏不了永遠偏多或今日方向延續，代表規則沒有可用 edge，應優先調整資料源或公式。",
           ])}
         </div>
@@ -1871,7 +1818,7 @@ def render_html(report: dict[str, Any]) -> str:
         </div>
         <div class="panel">
           <h2>限制</h2>
-          {bullet_list(unique_strings(tw_acc.get("limitations", []) + us_acc.get("limitations", []) + archived_acc.get("limitations", []))[:8])}
+          {bullet_list(unique_strings(tw_acc.get("limitations", []) + archived_acc.get("limitations", []))[:8])}
         </div>
       </section>
 
@@ -1902,39 +1849,6 @@ def render_html(report: dict[str, Any]) -> str:
         </div>
       </section>
 
-      <section id="us" class="page">
-        <div class="hero">
-          <h1>美股</h1>
-          <div class="subtle">SPY/QQQ/IWM 作為大盤、科技與小型股代理，搭配 VIX 與 FINRA margin debt。</div>
-        </div>
-        <div class="grid">{us_cards}</div>
-        <div class="panel us">
-          <h2>美股大盤</h2>
-          {bullet_list(summarize_us(us))}
-        </div>
-        <div class="panel">
-          <h2>觀察價位</h2>
-          <div class="split">
-            <div>
-              <h3>SPY</h3>
-              {bullet_list([
-                  f"20日區間支撐 {fmt_num(spy_levels['support_20d'], 2)}",
-                  f"20日區間壓力 {fmt_num(spy_levels['resistance_20d'], 2)}",
-                  f"20日線 {fmt_num(spy.ma20, 2)}，60日線 {fmt_num(spy.ma60, 2)}",
-              ])}
-            </div>
-            <div>
-              <h3>QQQ</h3>
-              {bullet_list([
-                  f"20日區間支撐 {fmt_num(qqq_levels['support_20d'], 2)}",
-                  f"20日區間壓力 {fmt_num(qqq_levels['resistance_20d'], 2)}",
-                  f"20日線 {fmt_num(qqq.ma20, 2)}，60日線 {fmt_num(qqq.ma60, 2)}",
-              ])}
-            </div>
-          </div>
-        </div>
-      </section>
-
       <section id="cross" class="page">
         <div class="hero">
           <h1>回推</h1>
@@ -1949,7 +1863,7 @@ def render_html(report: dict[str, Any]) -> str:
           {bullet_list([
               "價格跌破 20 日線且放量，優先視為供給壓力；若隔日縮量止跌，才改看整理。",
               "融資增加搭配下跌，通常代表槓桿尚未洗乾淨；融資減少搭配下跌，則是去槓桿正在發生。",
-              "美股 margin debt 是月資料，不適合判斷單日轉折，適合判斷槓桿背景溫度。",
+              "隔夜美股（SPY/QQQ/VIX）作為台股開盤的領先訊號，已納入台股模型輸入。",
           ])}
         </div>
       </section>
@@ -1964,9 +1878,7 @@ def render_html(report: dict[str, Any]) -> str:
               "TWSE FMTQIK：台股每日成交資訊",
               "TWSE MI_MARGN：上市信用交易統計",
               "TWSE BFI82U：三大法人買賣金額統計",
-              "Nasdaq historical API：SPY / QQQ / IWM / COMP 價量資料",
-              "Cboe VIX History：VIX 日資料",
-              "FINRA Margin Statistics：美股 margin debt 月資料",
+              "Nasdaq historical API + Cboe VIX：SPY / QQQ / VIX，僅作台股模型輸入特徵",
           ])}
           <p class="subtle">註：這是規則式市場分析，不是投資建議。</p>
         </div>
@@ -2603,9 +2515,9 @@ def main() -> int:
         store.close()
 
     # Overlay model predictions on top of rule-based predictions where available.
+    # US removed from output; only TW is predicted (US rows still feed TW features).
     for market_key, market_label, model_file, market_rows in (
         ("taiwan", "tw", "model_tw.json", tw_rows),
-        ("us", "us", "model_us.json", us_rows),
     ):
         rule_pred = report["predictions"][market_key]
         mp = model_prediction(
@@ -2629,6 +2541,10 @@ def main() -> int:
                 "bias": rule_pred["bias"],
                 "score": rule_pred["score"],
             }
+            if not mp.get("confidence_calibrated", True):
+                md = list(report["predictions"][market_key].get("missing_data") or [])
+                md.append("信心為未校準機率（原始 sigmoid，僅供方向參考）")
+                report["predictions"][market_key]["missing_data"] = md
         else:
             report["predictions"][market_key]["prediction_engine"] = "rule_fallback"
 

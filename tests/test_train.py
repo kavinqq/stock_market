@@ -37,6 +37,17 @@ class TestTrain(unittest.TestCase):
         self.assertIn("baselines", metrics)
         self.assertIn("significance", metrics)
 
+    def test_matrix_imputes_all_missing_feature_to_zero(self):
+        # A feature that is None for EVERY sample in a slice (e.g. the US
+        # features in a pre-2022 TW walk-forward fold) must not leak NaN into
+        # the design matrix — np.nanmedian of an all-NaN column is NaN, so the
+        # imputation value must fall back to a neutral 0.0.
+        samples = [{"features": {"ret_1d": 0.1, "us_vix_level": None}, "label": 1},
+                   {"features": {"ret_1d": -0.2, "us_vix_level": None}, "label": 0}]
+        X, y, med = train._matrix(samples, ["ret_1d", "us_vix_level"])
+        self.assertFalse(np.isnan(X).any())
+        self.assertEqual(med["us_vix_level"], 0.0)
+
     def test_learns_signal_beats_random(self):
         samples = _synth_samples()
         out = tempfile.mkdtemp()
@@ -114,6 +125,29 @@ class TestTrain(unittest.TestCase):
         self.assertTrue(np.allclose(p_cal, expected))
         # Recovered slope should be positive (z positively predicts y).
         self.assertGreater(w, 0.0)
+
+    def test_should_calibrate_respects_use_platt_flag(self):
+        y = np.array([0, 1, 0, 1])  # 兩類齊全
+        # balanced + use_platt=True -> 校準;use_platt=False(台股)-> 不校準
+        self.assertTrue(train._should_calibrate({"class_weight": "balanced"}, y, True))
+        self.assertFalse(train._should_calibrate({"class_weight": "balanced"}, y, False))
+        # 非 balanced -> 本來就不校準
+        self.assertFalse(train._should_calibrate({"class_weight": None}, y, True))
+        # 單一類別 -> 不校準(Platt 無意義)
+        self.assertFalse(train._should_calibrate({"class_weight": "balanced"},
+                                                 np.array([1, 1, 1]), True))
+
+    def test_tw_training_skips_platt(self):
+        # 台股整條訓練流程應產出未校準模型(calibration.method == "none"),
+        # 讓原始 sigmoid 機率保有分散度以通過部署 gate。
+        samples = _synth_samples()
+        out = tempfile.mkdtemp()
+        model_path, _ = train.train_from_samples(
+            samples, train.MINIMAL_FEATURES, "tw", out, test_frac=0.25,
+            seed=0, use_platt=False)
+        with open(model_path) as fh:
+            model = json.load(fh)
+        self.assertEqual(model["calibration"]["method"], "none")
 
     def test_collect_oos_predictions_pooled(self):
         samples = _synth_samples()

@@ -287,6 +287,25 @@ class TestBackfillTaifex(unittest.TestCase):
         self.assertEqual(len(ns.calls), n_first,
                          "Ingested TAIFEX month must not be re-fetched")
 
+    def test_current_month_query_end_capped_at_today(self):
+        # TAIFEX 拒絕含未來日期的區間(回 HTML),當月查詢須以今日為上界,不可用月底。
+        ns = FakeTaifexNS({})
+        backfill.backfill_taifex(self.store, ns, [date(2026, 7, 1)],
+                                 sleep=0, today=date(2026, 7, 16))
+        start_iso, end_iso = ns.calls[-1]
+        self.assertEqual(start_iso, "2026-07-01")
+        self.assertEqual(end_iso, "2026-07-16")
+
+    def test_block_response_not_marked_ingested(self):
+        # 收到封鎖/HTML(fetch 拋錯)時不得標記 ingested,否則資料永久遺失。
+        class BlockingNS:
+            def fetch_taifex_inst_futures(self, s, e=None):
+                raise RuntimeError("TAIFEX response not CSV (blocked or out-of-range)")
+        backfill.backfill_taifex(self.store, BlockingNS(), [date(2026, 7, 1)],
+                                 sleep=0, today=date(2026, 7, 16))
+        self.assertFalse(self.store.is_ingested("taifex_month", "2026-07"),
+                         "Blocked month must remain un-ingested for retry next run")
+
 
 class TestCoverage(unittest.TestCase):
     def setUp(self):

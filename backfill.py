@@ -179,7 +179,8 @@ def _month_end(month_start: date) -> date:
         else date(month_start.year, month_start.month + 1, 1)
     return nxt - timedelta(days=1)
 
-def backfill_taifex(store, ns, months, sleep: float = 1.5, budget=None) -> None:
+def backfill_taifex(store, ns, months, sleep: float = 1.5, budget=None,
+                    today: date = None) -> None:
     """Backfill TAIFEX TX net OI into EXISTING tw_daily rows (partial upsert).
 
     One date-range POST per month (resume key ingest_log("taifex_month",
@@ -187,20 +188,40 @@ def backfill_taifex(store, ns, months, sleep: float = 1.5, budget=None) -> None:
     columns already in tw_daily are preserved. Rows for dates absent from
     tw_daily are still upserted (date + tx cols) so a later price backfill can
     fill the rest.
+
+    The current month's query end is capped at `today`: TAIFEX rejects ranges
+    containing future dates with an HTML error page. A fetch that raises (block
+    / out-of-range / network) does NOT mark the month ingested, so a later run
+    retries it instead of silently losing data.
     """
+    if today is None:
+        today = datetime.now(F.TAIPEI_TZ).date()
     for month_start in months:
         key = month_start.strftime("%Y-%m")
         if store.is_ingested("taifex_month", key):
             continue
-        _spend(budget)
-        try:
-            taifex = ns.fetch_taifex_inst_futures(
-                month_start.isoformat(), _month_end(month_start).isoformat())
-        except BudgetExhausted:
-            raise
-        except Exception as exc:
-            print(f"[backfill_taifex] fetch error {key}: {exc}", file=sys.stderr)
-            continue
+        end = min(_month_end(month_start), today)
+        if end < month_start:
+            continue  # 整個月都在未來,尚無資料可抓
+        # 當月最後幾日(今日尚未公布 / 週末假日)會讓 TAIFEX 整段回 HTML,
+        # 逐日往前退到有公布資料的交易日為止(過去的完整月份第一次即命中)。
+        taifex, last_exc = None, None
+        attempt_end = end
+        floor = max(month_start, end - timedelta(days=9))
+        while attempt_end >= floor:
+            _spend(budget)
+            try:
+                taifex = ns.fetch_taifex_inst_futures(
+                    month_start.isoformat(), attempt_end.isoformat())
+                break
+            except BudgetExhausted:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                attempt_end -= timedelta(days=1)
+        if taifex is None:
+            print(f"[backfill_taifex] fetch error {key}: {last_exc}", file=sys.stderr)
+            continue  # 不標記 ingested → 下次重試
         for d, vals in taifex.items():
             store.upsert_tw_daily({
                 "date": d,
@@ -399,7 +420,11 @@ def incremental_run(store, ns, start: date, budget: Budget,
                 "SELECT key FROM ingest_log WHERE source='taifex_month' AND status='ok'"
             ).fetchall()
         }
-        cur = date(start.year, start.month, 1)
+        # TAIFEX futContractsDate 只服務近約 3 年的滾動視窗,再早只會回 HTML,
+        # 故起點不早於 today−3 年,避免每次都白抓一批 pre-window 月份。
+        taifex_start = max(date(start.year, start.month, 1),
+                           date(today_d.year - 3, today_d.month, 1))
+        cur = taifex_start
         taifex_months = []
         while cur <= end_month:
             if cur.strftime("%Y-%m") not in taifex_ingested:

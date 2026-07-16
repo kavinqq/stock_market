@@ -308,7 +308,13 @@ def fetch_taifex_inst_futures(start_iso: str,
         "queryEndDate": end_iso.replace("-", "/"),
         "commodityId": "TXF",
     })
-    return parse_taifex_inst_futures(_curl_post_big5(TAIFEX_INST_FUT_URL, data))
+    text = _curl_post_big5(TAIFEX_INST_FUT_URL, data)
+    # 合法回應為 CSV(含「商品名稱」表頭);含未來日期或被封鎖時 TAIFEX 回 HTML
+    # 錯誤頁,不能默默當成「無資料」——拋錯讓呼叫端決定是否重試/不標記完成。
+    if "商品名稱" not in text:
+        raise RuntimeError(
+            f"TAIFEX response not CSV (blocked or out-of-range): {start_iso}~{end_iso}")
+    return parse_taifex_inst_futures(text)
 
 
 def fetch_twse_summary(latest_date: str) -> Optional[dict[str, Any]]:

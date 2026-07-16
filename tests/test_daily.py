@@ -15,6 +15,30 @@ def _rows():
              "turnover": 5e11, "price_asof_taipei": f"2026-06-{d:02d}T14:30:00+08:00"}
             for d in range(1, 28)]
 
+
+def _indicators(close=100.0):
+    # All-neutral IndicatorSet kwargs; enough for build_taiwan_prediction's scoring.
+    return {
+        "close": close, "day_change_pct": 0.0, "five_day_pct": 0.0,
+        "twenty_day_pct": 0.0, "sixty_day_pct": 0.0, "ma5": close, "ma20": close,
+        "ma60": close, "volume_ratio_20d": 1.0, "drawdown_from_20d_high": 0.0,
+        "drawdown_from_60d_high": 0.0, "trend_label": "中性",
+    }
+
+
+def _prediction_report():
+    bars = [{"date": f"2026-07-{d:02d}", "close": 100.0 + d, "turnover": 5e11,
+             "volume": 1e9} for d in range(1, 11)]
+    return {
+        "report_date": "2026-07-10",
+        "taiwan": {"latest_date": "2026-07-10", "bars": bars,
+                   "indicators": _indicators(), "margin": {}, "institutional": {},
+                   "summary": {}},
+        "us": {"latest_date": "2026-07-09",
+               "series": {"QQQ": {"indicators": _indicators(470.0)}},
+               "vix": {"indicators": {"close": 16.0}}},
+    }
+
 class TestDaily(unittest.TestCase):
     def test_model_prediction_returns_proba(self):
         d = tempfile.mkdtemp(); path = os.path.join(d, "model_tw.json")
@@ -110,6 +134,52 @@ class TestDaily(unittest.TestCase):
             self.assertEqual(us_row["spy_close"], 550.0)
             store.close()
 
+
+    def test_archived_eval_skips_us_market(self):
+        """US removed from output: evaluate_archived_predictions must only produce
+        台股 records even when an archived JSON still carries a 美股 prediction."""
+        from daily_market_report import evaluate_archived_predictions
+        report = {
+            "report_date": "2026-07-03",
+            "taiwan": {"bars": [
+                {"date": "2026-07-01", "close": 100.0},
+                {"date": "2026-07-02", "close": 102.0},
+            ]},
+            # us block still fetched, but must not be evaluated for scoring
+            "us": {"series": {"SPY": {"bars": [
+                {"date": "2026-07-01", "close": 500.0},
+                {"date": "2026-07-02", "close": 510.0},
+            ]}}},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            old = {
+                "report_date": "2026-07-01",
+                "taiwan": {"latest_date": "2026-07-01"},
+                "us": {"latest_date": "2026-07-01"},
+                "predictions": {
+                    "taiwan": {"market": "台股", "bias": "偏多",
+                               "target_date_estimate": "2026-07-02",
+                               "neutral_threshold_pct": 0.005,
+                               "formula_version": "rule-v1.1", "reasons": []},
+                    "us": {"market": "美股", "bias": "偏空",
+                           "target_date_estimate": "2026-07-02",
+                           "neutral_threshold_pct": 0.005,
+                           "formula_version": "rule-v1.1", "reasons": []},
+                },
+            }
+            with open(os.path.join(d, "2026-07-01.json"), "w") as fh:
+                json.dump(old, fh)
+            out = evaluate_archived_predictions(report, __import__("pathlib").Path(d))
+        markets = {r["market"] for r in out["records"]}
+        self.assertEqual(markets, {"台股"})
+        self.assertNotIn("美股", markets)
+
+    def test_build_predictions_has_no_us_key(self):
+        """build_predictions must only return a taiwan prediction (US removed)."""
+        from daily_market_report import build_predictions
+        preds = build_predictions(_prediction_report())
+        self.assertIn("taiwan", preds)
+        self.assertNotIn("us", preds)
 
     def test_sparsity_fallback_returns_none(self):
         """Model with full TW canonical feature list falls back when data is price-only (chip+US features absent)."""

@@ -35,9 +35,12 @@ except Exception as e:
 PY
 )
 
+# Pathspec on commit => ONLY models/model_tw.json is committed, even if the user
+# happens to have other changes staged. Any such staged changes stay staged.
 git commit -q \
     -m "chore(model): TW self-tune snapshot $(date +%F)" \
     -m "$SUMMARY" \
     -m "Automated retrain+gate+promote via com.kuanlin.stockmarket.selftune." \
-    -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+    -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" \
+    -- models/model_tw.json
 echo "self_tune: committed model snapshot — $SUMMARY"

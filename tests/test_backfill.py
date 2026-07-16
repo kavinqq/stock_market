@@ -247,6 +247,47 @@ class TestBackfillValuation(unittest.TestCase):
                            "Some dates must remain un-ingested so next run can resume")
 
 
+class FakeTaifexNS:
+    """Fake ns for backfill_taifex — returns a fixed per-date map, records calls."""
+    def __init__(self, by_date):
+        self.by_date = by_date
+        self.calls = []
+
+    def fetch_taifex_inst_futures(self, start_iso, end_iso=None):
+        self.calls.append((start_iso, end_iso))
+        return self.by_date
+
+
+class TestBackfillTaifex(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def test_partial_upsert_preserves_price_and_adds_oi(self):
+        # 既有 tw_daily 列(已回填價量),TAIFEX 只補期貨欄位,不得覆蓋 close。
+        self.store.upsert_tw_daily({
+            "date": "2026-07-14", "close": 45631.59,
+            "price_asof_taipei": "2026-07-14T14:30:00+08:00"})
+        ns = FakeTaifexNS({"2026-07-14": {
+            "tx_foreign_oi_net_lots": -83390.0, "tx_inst_oi_net_lots": -7165.0}})
+        backfill.backfill_taifex(self.store, ns, [date(2026, 7, 1)], sleep=0)
+        r = self.store.get_tw_rows()[0]
+        self.assertEqual(r["close"], 45631.59)                # preserved
+        self.assertEqual(r["tx_foreign_oi_net_lots"], -83390.0)
+        self.assertEqual(r["tx_inst_oi_net_lots"], -7165.0)
+        self.assertIsNotNone(r["taifex_asof_taipei"])
+        self.assertTrue(self.store.is_ingested("taifex_month", "2026-07"))
+
+    def test_second_run_skips_ingested_month(self):
+        ns = FakeTaifexNS({})
+        backfill.backfill_taifex(self.store, ns, [date(2026, 7, 1)], sleep=0)
+        n_first = len(ns.calls)
+        backfill.backfill_taifex(self.store, ns, [date(2026, 7, 1)], sleep=0)
+        self.assertEqual(len(ns.calls), n_first,
+                         "Ingested TAIFEX month must not be re-fetched")
+
+
 class TestCoverage(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -326,6 +367,9 @@ class FakeIncrementalNS:
         return {}
 
     def fetch_twse_summary(self, date_iso):
+        return {}
+
+    def fetch_taifex_inst_futures(self, start_iso, end_iso=None):
         return {}
 
 

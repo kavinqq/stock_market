@@ -2,7 +2,7 @@
 """Offline multi-year history backfill into SQLite (point-in-time aware)."""
 from __future__ import annotations
 import argparse, random, sys, time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from marketlib import fetchers as F
 from marketlib.store import HistoryStore
 
@@ -173,6 +173,44 @@ def backfill_tw(store, ns, months, sleep: float = 1.5,
                 time.sleep(sleep + random.uniform(0, 0.5))
         if not month_had_block:
             store.mark_ingested("tw_month", key)
+
+def _month_end(month_start: date) -> date:
+    nxt = date(month_start.year + 1, 1, 1) if month_start.month == 12 \
+        else date(month_start.year, month_start.month + 1, 1)
+    return nxt - timedelta(days=1)
+
+def backfill_taifex(store, ns, months, sleep: float = 1.5, budget=None) -> None:
+    """Backfill TAIFEX TX net OI into EXISTING tw_daily rows (partial upsert).
+
+    One date-range POST per month (resume key ingest_log("taifex_month",
+    "YYYY-MM")). Only the tx_* / taifex_asof columns are written, so price/chip
+    columns already in tw_daily are preserved. Rows for dates absent from
+    tw_daily are still upserted (date + tx cols) so a later price backfill can
+    fill the rest.
+    """
+    for month_start in months:
+        key = month_start.strftime("%Y-%m")
+        if store.is_ingested("taifex_month", key):
+            continue
+        _spend(budget)
+        try:
+            taifex = ns.fetch_taifex_inst_futures(
+                month_start.isoformat(), _month_end(month_start).isoformat())
+        except BudgetExhausted:
+            raise
+        except Exception as exc:
+            print(f"[backfill_taifex] fetch error {key}: {exc}", file=sys.stderr)
+            continue
+        for d, vals in taifex.items():
+            store.upsert_tw_daily({
+                "date": d,
+                "tx_foreign_oi_net_lots": vals.get("tx_foreign_oi_net_lots"),
+                "tx_inst_oi_net_lots": vals.get("tx_inst_oi_net_lots"),
+                "taifex_asof_taipei": F.taifex_asof(d),
+            })
+        store.mark_ingested("taifex_month", key)
+        if sleep:
+            time.sleep(sleep + random.uniform(0, 0.5))
 
 def backfill_us(store, start: date, end: date, sleep: float = 0.5,
                 max_retries: int = 3) -> None:
@@ -355,6 +393,21 @@ def incremental_run(store, ns, start: date, budget: Budget,
         backfill_tw(store, ns, missing_months, sleep=sleep,
                     max_retries=max_retries, backoff=backoff, budget=budget)
 
+        # --- P2.5: TAIFEX TX futures OI history (~1 request/month) ---
+        taifex_ingested = {
+            row[0] for row in store.conn.execute(
+                "SELECT key FROM ingest_log WHERE source='taifex_month' AND status='ok'"
+            ).fetchall()
+        }
+        cur = date(start.year, start.month, 1)
+        taifex_months = []
+        while cur <= end_month:
+            if cur.strftime("%Y-%m") not in taifex_ingested:
+                taifex_months.append(cur)
+            cur = date(cur.year + 1, 1, 1) if cur.month == 12 \
+                else date(cur.year, cur.month + 1, 1)
+        backfill_taifex(store, ns, taifex_months, sleep=sleep, budget=budget)
+
         # --- P3: pre-warm per-stock STOCK_DAY (recent 6 months) ---
         recent_months = _month_starts(today_d, 6)
         for code in TW50_CONSTITUENTS:
@@ -469,6 +522,17 @@ def main() -> int:
             cur = date(cur.year + 1, 1, 1) if cur.month == 12 else date(cur.year, cur.month + 1, 1)
         backfill_tw(store, F, months, sleep=a.sleep,
                     max_retries=a.max_retries, backoff=a.backoff)
+    if "taifex" in sources:
+        months = []
+        cur = date(start.year, start.month, 1)
+        while cur <= end:
+            months.append(cur)
+            cur = date(cur.year + 1, 1, 1) if cur.month == 12 else date(cur.year, cur.month + 1, 1)
+        budget = Budget(max_requests=a.max_requests)
+        try:
+            backfill_taifex(store, F, months, sleep=a.sleep, budget=budget)
+        except BudgetExhausted:
+            pass
     if "us" in sources:
         backfill_us(store, start, end, sleep=a.sleep, max_retries=a.max_retries)
     if "finra" in sources:

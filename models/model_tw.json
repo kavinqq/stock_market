@@ -2,7 +2,7 @@
   "artifact": "production_refit",
   "market": "tw",
   "model_type": "logistic_regression",
-  "trained_at": "2026-07-16T11:39:51",
+  "trained_at": "2026-07-16T11:42:29",
   "train_period": [
     "2015-01-05",
     "2026-07-14"

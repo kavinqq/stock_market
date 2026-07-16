@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kuanlin.stockmarket.selftune</string>
+
+  <!-- Daily self-tuning: retrain the TW model on all data through today, run the
+       honest OOS deploy gate (passes_deploy_gate), and PROMOTE to
+       models/model_tw.json only if it passes. The gate is the safety rail: a
+       degenerate model (a class never predicted, or below the random-prior
+       baseline) is NOT promoted, so unattended runs can never deploy a bad
+       model. Requires sklearn -> uses the project .venv, NOT /usr/bin/python3. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kuanlin/stock_market/.venv/bin/python</string>
+    <string>/Users/kuanlin/stock_market/train.py</string>
+    <string>--market</string>
+    <string>tw</string>
+    <string>--out</string>
+    <string>/Users/kuanlin/stock_market/models/candidate_auto</string>
+    <string>--promote-if-passes</string>
+    <string>--promote-dir</string>
+    <string>/Users/kuanlin/stock_market/models</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/kuanlin/stock_market</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- Mon-Fri 20:00 local: after the 18:30 report (stores today's data incl.
+       TAIFEX) and the 19:30 incremental backfill. launchd catches up on wake. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kuanlin/stock_market/logs/selftune.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kuanlin/stock_market/logs/selftune.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

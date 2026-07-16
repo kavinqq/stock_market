@@ -25,6 +25,17 @@ class TestStore(unittest.TestCase):
         self.assertEqual(rows[0]["close"], 101.0)
         self.assertEqual(rows[0]["inst_asof_taipei"], "2026-06-26T16:00:00+08:00")
 
+    def test_taifex_futures_columns_roundtrip(self):
+        self.s.upsert_tw_daily({
+            "date": "2026-07-14", "close": 100.0,
+            "tx_foreign_oi_net_lots": -83390.0, "tx_inst_oi_net_lots": -7165.0,
+            "taifex_asof_taipei": "2026-07-14T15:30:00+08:00",
+        })
+        row = self.s.get_tw_rows()[0]
+        self.assertEqual(row["tx_foreign_oi_net_lots"], -83390.0)
+        self.assertEqual(row["tx_inst_oi_net_lots"], -7165.0)
+        self.assertEqual(row["taifex_asof_taipei"], "2026-07-14T15:30:00+08:00")
+
     def test_ingest_cursor(self):
         self.assertFalse(self.s.is_ingested("tw_margin", "2026-06-26"))
         self.s.mark_ingested("tw_margin", "2026-06-26")
@@ -35,6 +46,30 @@ class TestStore(unittest.TestCase):
             self.s.upsert_us_daily({"date": d, "spy_close": 1.0})
         rows = self.s.get_us_rows(start="2026-06-05", end="2026-06-15")
         self.assertEqual([r["date"] for r in rows], ["2026-06-10"])
+
+class TestSchemaMigration(unittest.TestCase):
+    def test_init_schema_adds_new_columns_to_old_db(self):
+        import sqlite3, tempfile, os
+        db = os.path.join(tempfile.mkdtemp(), "old.db")
+        # 模擬舊版 DB:tw_daily 只有部分欄位,沒有 TAIFEX 期貨欄位。
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE tw_daily (date TEXT PRIMARY KEY, close REAL)")
+        conn.execute("INSERT INTO tw_daily (date, close) VALUES ('2026-07-14', 100.0)")
+        conn.commit()
+        conn.close()
+
+        s = HistoryStore(db)
+        s.init_schema()  # 應該用 ALTER TABLE 補上缺欄位,而非重建/遺失資料
+        cols = {r[1] for r in s.conn.execute("PRAGMA table_info(tw_daily)").fetchall()}
+        self.assertIn("tx_foreign_oi_net_lots", cols)
+        self.assertIn("taifex_asof_taipei", cols)
+        # 既有資料保留,且新欄位可寫入。
+        s.upsert_tw_daily({"date": "2026-07-14", "tx_foreign_oi_net_lots": -83390.0})
+        row = s.get_tw_rows()[0]
+        self.assertEqual(row["close"], 100.0)
+        self.assertEqual(row["tx_foreign_oi_net_lots"], -83390.0)
+        s.close()
+
 
 class TestStockTables(unittest.TestCase):
     def setUp(self):

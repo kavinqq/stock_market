@@ -17,6 +17,7 @@ TWSE_BASE = "https://www.twse.com.tw/rwd/zh"
 NASDAQ_BASE = "https://api.nasdaq.com/api/quote"
 CBOE_VIX_CSV = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
 FINRA_MARGIN_URL = "https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics"
+TAIFEX_INST_FUT_URL = "https://www.taifex.com.tw/cht/3/futContractsDateDown"
 
 NASDAQ_HEADERS = {
     "User-Agent": USER_AGENT,
@@ -257,6 +258,59 @@ def fetch_twse_institutional(latest_date: str) -> Optional[dict[str, Any]]:
     return {"source_date": latest_date, "rows": rows}
 
 
+TX_NET_OI_LOTS_IDX = 13  # 多空未平倉口數淨額 in futContractsDateDown CSV
+
+def parse_taifex_inst_futures(csv_text: str) -> dict[str, dict[str, Optional[float]]]:
+    """Parse TAIFEX 三大法人-區分各期貨契約 CSV (already decoded to utf-8).
+
+    Returns {date_iso: {"tx_foreign_oi_net_lots", "tx_inst_oi_net_lots"}} for
+    臺股期貨 only. Net OI lots = 多空未平倉口數淨額 (column index 13). The
+    institutional total sums 自營商 + 投信 + 外資及陸資; foreign is the row
+    whose 身份別 contains 外資. The header row is skipped naturally because its
+    商品名稱 cell is not 臺股期貨.
+    """
+    out: dict[str, dict[str, Optional[float]]] = {}
+    for row in csv.reader(csv_text.splitlines()):
+        if len(row) <= TX_NET_OI_LOTS_IDX or row[1].strip() != "臺股期貨":
+            continue
+        net_oi = clean_num(row[TX_NET_OI_LOTS_IDX])
+        if net_oi is None:
+            continue
+        date_iso = row[0].strip().replace("/", "-")
+        agg = out.setdefault(
+            date_iso, {"tx_foreign_oi_net_lots": None, "tx_inst_oi_net_lots": 0.0})
+        agg["tx_inst_oi_net_lots"] = (agg["tx_inst_oi_net_lots"] or 0.0) + net_oi
+        if "外資" in row[2]:
+            agg["tx_foreign_oi_net_lots"] = net_oi
+    return out
+
+
+def _curl_post_big5(url: str, data: str) -> str:
+    curl_path = shutil.which("curl")
+    if not curl_path:
+        raise RuntimeError("curl is not available")
+    args = [curl_path, "--http1.1", "-fsSL", "--retry", "2",
+            "--connect-timeout", "20", "--max-time", "90",
+            "-A", USER_AGENT, "--data", data, url]
+    result = subprocess.run(args, capture_output=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(f"curl POST failed for {url}: {detail}")
+    return result.stdout.decode("big5", "replace")
+
+
+def fetch_taifex_inst_futures(start_iso: str,
+                              end_iso: Optional[str] = None) -> dict[str, dict[str, Optional[float]]]:
+    """Fetch 三大法人 TX net OI over [start_iso, end_iso] (one POST, date range)."""
+    end_iso = end_iso or start_iso
+    data = urllib.parse.urlencode({
+        "queryStartDate": start_iso.replace("-", "/"),
+        "queryEndDate": end_iso.replace("-", "/"),
+        "commodityId": "TXF",
+    })
+    return parse_taifex_inst_futures(_curl_post_big5(TAIFEX_INST_FUT_URL, data))
+
+
 def fetch_twse_summary(latest_date: str) -> Optional[dict[str, Any]]:
     url = (
         f"{TWSE_BASE}/afterTrading/MI_INDEX?"
@@ -476,3 +530,8 @@ def finra_asof(month: str) -> str:
     y, m = (int(x) for x in month.split("-"))
     ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
     return _iso(datetime(ny, nm, 20, 23, 59, tzinfo=TAIPEI_TZ))
+
+def taifex_asof(date_iso: str) -> str:
+    # TAIFEX 三大法人期貨部位約 15:00 收盤後公布;保守記 15:30(< 18:30 決策時點)。
+    d = datetime.fromisoformat(date_iso).replace(tzinfo=TAIPEI_TZ)
+    return _iso(d.replace(hour=15, minute=30))

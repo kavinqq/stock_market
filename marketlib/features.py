@@ -56,6 +56,7 @@ FEATURE_NAMES_COMMON = [
 ]
 FEATURE_NAMES_TW = FEATURE_NAMES_COMMON + [
     "margin_change_pct", "inst_net_z60", "breadth_ratio_z60",
+    "tx_foreign_oi_z60", "tx_inst_oi_chg_z60",
     "us_spy_ret_1d", "us_qqq_ret_1d", "us_vix_level",
 ]
 FEATURE_NAMES_US = FEATURE_NAMES_COMMON + [
@@ -124,6 +125,16 @@ def build_feature_row(market, rows, idx, us_rows, decision_time):
             dn = usable_value(r, "dec_count", "breadth_asof_taipei", decision_time_for(r["date"]))
             ratios.append(up / dn if (up is not None and dn not in (None, 0)) else None)
         f["breadth_ratio_z60"] = zscore_excluding_t(ratios, 60)
+        # TAIFEX 期貨籌碼:外資期貨未平倉淨口數(布局水位)與三大法人淨口數日變化
+        # (當日籌碼動能)。每列都用自己的決策時點 + taifex asof 閘門防洩漏。
+        foreign_oi = [usable_value(r, "tx_foreign_oi_net_lots", "taifex_asof_taipei",
+                                   decision_time_for(r["date"])) for r in window]
+        f["tx_foreign_oi_z60"] = zscore_excluding_t(foreign_oi, 60)
+        inst_oi = [usable_value(r, "tx_inst_oi_net_lots", "taifex_asof_taipei",
+                                decision_time_for(r["date"])) for r in window]
+        inst_oi_chg = [b - a if (a is not None and b is not None) else None
+                       for a, b in zip(inst_oi, inst_oi[1:])]
+        f["tx_inst_oi_chg_z60"] = zscore_excluding_t(inst_oi_chg, 60)
         us = latest_usable_us(us_rows, decision_time)
         prev_us = latest_usable_us(
             [r for r in us_rows if us and r["date"] < us["date"]], decision_time) if us else None

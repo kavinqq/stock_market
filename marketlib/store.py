@@ -7,7 +7,9 @@ TW_COLUMNS = [
     "margin_balance_ntd", "margin_balance_change_ntd", "short_lots",
     "foreign_net_ntd", "trust_net_ntd", "dealer_net_ntd", "inst_total_net_ntd",
     "adv_count", "dec_count",
+    "tx_foreign_oi_net_lots", "tx_inst_oi_net_lots",
     "price_asof_taipei", "margin_asof_taipei", "inst_asof_taipei", "breadth_asof_taipei",
+    "taifex_asof_taipei",
     "source_updated_at", "available_at_taipei", "quality_flags", "missing_fields",
 ]
 US_COLUMNS = [
@@ -42,17 +44,20 @@ STOCK_MONTHLY_REVENUE_COLUMNS = [
 _TEXT_COLS = {"stock_no", "date", "month", "source_updated_at", "quality_flags",
               "missing_fields", "publish_date"}
 
+def _col_type_simple(c: str) -> str:
+    if c in {"date", "month"} or c.endswith("_taipei") or c in {
+        "source_updated_at", "quality_flags", "missing_fields", "publish_date",
+    }:
+        return "TEXT"
+    return "REAL"
+
 def _col_defs(cols: list[str], pk: str) -> str:
     parts = []
     for c in cols:
         if c == pk:
             parts.append(f"{c} TEXT PRIMARY KEY")
-        elif c in {"date", "month"} or c.endswith("_taipei") or c in {
-            "source_updated_at", "quality_flags", "missing_fields", "publish_date",
-        }:
-            parts.append(f"{c} TEXT")
         else:
-            parts.append(f"{c} REAL")
+            parts.append(f"{c} {_col_type_simple(c)}")
     return ", ".join(parts)
 
 def _col_defs_composite(cols: list[str], pk_cols: list[str]) -> str:
@@ -92,7 +97,17 @@ class HistoryStore:
             f"CREATE TABLE IF NOT EXISTS stock_monthly_revenue "
             f"({_col_defs_composite(STOCK_MONTHLY_REVENUE_COLUMNS, ['stock_no', 'month'])})"
         )
+        # 對既有 DB 補上新增欄位(CREATE TABLE IF NOT EXISTS 不會動已存在的表)。
+        self._add_missing_columns("tw_daily", TW_COLUMNS)
+        self._add_missing_columns("us_daily", US_COLUMNS)
         c.commit()
+
+    def _add_missing_columns(self, table: str, cols: list[str]) -> None:
+        existing = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in cols:
+            if col not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {_col_type_simple(col)}")
 
     def _upsert(self, table: str, cols: list[str], pk: str, row: dict) -> None:
         names = [c for c in cols if c in row]

@@ -84,5 +84,54 @@ class TestDataset(unittest.TestCase):
         self.assertIn("ret_1d", feats)
         self.assertIn("close_vs_ma20", feats)
 
+
+def _mkdate(i):
+    from datetime import datetime, timedelta
+    return (datetime(2026, 1, 1) + timedelta(days=i)).date().isoformat()
+
+def _tw_oi_rows(last_foreign, last_asof=None):
+    """62 天 tw_daily 列;前 61 天外資 OI 走有變異的基準,最後一天可覆寫。"""
+    pattern = [100.0, 130.0, 90.0, 110.0]
+    rows = []
+    for i in range(62):
+        d = _mkdate(i)
+        foreign = pattern[i % 4] if i < 61 else last_foreign
+        rows.append({
+            "date": d, "close": 100.0 + i, "volume": 1e9, "turnover": 5e11,
+            "price_asof_taipei": f"{d}T14:30:00+08:00",
+            "available_at_taipei": f"{d}T14:30:00+08:00",
+            "tx_foreign_oi_net_lots": foreign,
+            "tx_inst_oi_net_lots": foreign * 2,
+            "taifex_asof_taipei": (last_asof if (i == 61 and last_asof)
+                                   else f"{d}T15:30:00+08:00"),
+        })
+    return rows
+
+class TestTaifexFeatures(unittest.TestCase):
+    def test_feature_row_has_taifex_keys(self):
+        rows = _tw_oi_rows(last_foreign=110.0)
+        feats = build_feature_row("tw", rows, len(rows) - 1,
+                                  [], decision_time_for(rows[-1]["date"]))
+        self.assertIn("tx_foreign_oi_z60", feats)
+        self.assertIn("tx_inst_oi_chg_z60", feats)
+
+    def test_positive_oi_spike_gives_positive_zscore(self):
+        rows = _tw_oi_rows(last_foreign=100000.0)  # 外資大幅加碼多單
+        feats = build_feature_row("tw", rows, len(rows) - 1,
+                                  [], decision_time_for(rows[-1]["date"]))
+        self.assertGreater(feats["tx_foreign_oi_z60"], 3.0)
+
+    def test_late_asof_blocks_current_day_leakage(self):
+        # 同樣的大幅加碼,但 TAIFEX 尚未公布(asof 晚於 18:30)時,當前值不得被採用。
+        avail = build_feature_row(
+            "tw", _tw_oi_rows(100000.0, last_asof=None), 61,
+            [], decision_time_for(_mkdate(61)))["tx_foreign_oi_z60"]
+        late = build_feature_row(
+            "tw", _tw_oi_rows(100000.0, last_asof=f"{_mkdate(61)}T20:00:00+08:00"), 61,
+            [], decision_time_for(_mkdate(61)))["tx_foreign_oi_z60"]
+        # 已公布 -> spike 反映在 z 分數;未公布 -> 退回前一日,spike 不得洩漏。
+        self.assertGreater(avail, 3.0)
+        self.assertLess(late, avail)
+
 if __name__ == "__main__":
     unittest.main()

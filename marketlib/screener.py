@@ -386,3 +386,38 @@ def technical_intersection(metrics: dict) -> dict:
         "metrics_snapshot": _metrics_snapshot(metrics),
         "warnings": _warnings(metrics),
     }
+
+
+def rank_candidates(rows: list[dict]) -> list[dict]:
+    """Order the intersection shortlist, and record each stock's position.
+
+    A deliberately lexicographic sort over facts rather than a weighted score,
+    so the ordering can be checked by eye and nothing hides inside a coefficient
+    nobody chose on evidence:
+
+      1. fewest 延伸過度 warnings — every stock here already satisfies the same
+         core conditions, so what separates them is how much of the move has
+         already happened. A screen is for finding room left to run.
+      2. most bonus conditions met — supporting evidence, once stretch is equal.
+      3. best composite rank — the existing multi-factor score as the final
+         tie-break, so fundamentals still speak.
+
+    This is an ordering of *setup quality as measured today*. It is not a return
+    forecast and carries no backtest; ``rank 1`` means "cleanest technical
+    setup", never "most likely to rise".
+
+    Returns a new list of the candidates only, sorted, each with
+    ``intersection["shortlist_rank"]`` set. The input list is not reordered.
+    """
+    candidates = [r for r in rows if (r.get("intersection") or {}).get("is_candidate")]
+    ordered = sorted(
+        candidates,
+        key=lambda r: (
+            len(r["intersection"].get("warnings") or []),
+            -(r["intersection"].get("bonus_passed") or 0),
+            r.get("rank") if r.get("rank") is not None else 10 ** 6,
+        ),
+    )
+    for position, row in enumerate(ordered, start=1):
+        row["intersection"]["shortlist_rank"] = position
+    return ordered

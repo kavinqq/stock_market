@@ -1237,8 +1237,7 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
     if not scored:
         return lines + ["- 個股技術指標資料不足，無法計算交集。", ""]
 
-    hits = [r for r in scored if r["intersection"]["is_candidate"]]
-    hits.sort(key=lambda r: (-r["intersection"]["score"], r.get("rank", 999)))
+    hits = _screener.rank_candidates(scored)
 
     core_total = scored[0]["intersection"]["core_total"]
     lines.append(
@@ -1267,29 +1266,33 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
         lines.append("")
         return lines
 
-    lines.append("通過名單（依加分項與綜合排名排序，附指標數值供比較）：")
+    lines.append(
+        "通過名單，依「延伸過度警訊少 → 加分項多 → 綜合排名前」排序。"
+        "排名反映**今日技術面型態的乾淨程度**，不是報酬預測，也未做過勝率回測："
+    )
     lines.append("")
-    lines.append("| 代號 | 名稱 | 加分 | 綜排 | 距月線 | KD (K/D) | RSI | MACD柱 | 布林%b | 量比 | 注意 |")
-    lines.append("|------|------|------|------|--------|----------|-----|--------|--------|------|------|")
+    lines.append("| 排名 | 代號 | 名稱 | 警訊 | 加分 | 綜排 | 距月線 | KD (K/D) | RSI | MACD柱 | 布林%b | 量比 |")
+    lines.append("|------|------|------|------|------|------|--------|----------|-----|--------|--------|------|")
     for r in hits:
         ins = r["intersection"]
         m = ins["metrics_snapshot"]
         kd_str = (f"{m['kd_k']:.0f}/{m['kd_d']:.0f}"
                   if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
         lines.append(
-            f"| {r.get('code','')} | {r.get('name','')} "
+            f"| **{ins.get('shortlist_rank','—')}** | {r.get('code','')} | {r.get('name','')} "
+            f"| {'⚠️ ' + str(len(ins['warnings'])) if ins['warnings'] else '—'} "
             f"| {ins['bonus_passed']}/{ins['bonus_total']} | {r.get('rank','—')} "
             f"| {fmt_pct(m.get('close_vs_ma20'))} | {kd_str} "
             f"| {fmt_num(m.get('rsi'), 0)} | {fmt_num(m.get('macd_hist'), 2)} "
-            f"| {fmt_num(m.get('pctb'), 2)} | {fmt_num(m.get('volume_ratio_20d'), 2)} "
-            f"| {'⚠️ ' + str(len(ins['warnings'])) if ins['warnings'] else '—'} |"
+            f"| {fmt_num(m.get('pctb'), 2)} | {fmt_num(m.get('volume_ratio_20d'), 2)} |"
         )
     lines.append("")
     flagged = [r for r in hits if r["intersection"]["warnings"]]
     if flagged:
         lines.append("⚠️ 延伸過度提醒（條件仍成立，但屬追高風險，是否進場請自行判斷）：")
         for r in flagged:
-            lines.append(f"- **{r.get('code','')} {r.get('name','')}**")
+            lines.append(f"- **#{r['intersection'].get('shortlist_rank','—')} "
+                         f"{r.get('code','')} {r.get('name','')}**")
             for w in r["intersection"]["warnings"]:
                 lines.append(f"  - {w}")
         lines.append("")
@@ -2545,8 +2548,7 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
         return ('<div class="panel"><h2>技術面交集</h2>'
                 '<p class="subtle">個股技術指標資料不足，無法計算交集。</p></div>')
 
-    hits = [r for r in scored if r["intersection"]["is_candidate"]]
-    hits.sort(key=lambda r: (-r["intersection"]["score"], r.get("rank", 999)))
+    hits = _screener.rank_candidates(scored)
     core_total = scored[0]["intersection"]["core_total"]
     core_list = "".join(f'<li>{esc(t)}</li>' for t in _screener.core_condition_texts())
     head = (
@@ -2579,7 +2581,8 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
                   if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
         missing = "；".join(ins["bonus_failed"])
         body_rows += (
-            f'<tr><td>{esc(r.get("code",""))}</td><td>{esc(r.get("name",""))}</td>'
+            f'<tr><td><strong>{ins.get("shortlist_rank","—")}</strong></td>'
+            f'<td>{esc(r.get("code",""))}</td><td>{esc(r.get("name",""))}</td>'
             f'<td>{ins["bonus_passed"]}/{ins["bonus_total"]}</td>'
             f'<td>{r.get("rank","—")}</td>'
             f'<td>{esc(fmt_pct(m.get("close_vs_ma20")))}</td>'
@@ -2593,14 +2596,16 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
         )
     blocks = (
         '<div style="overflow-x:auto"><table><thead><tr>'
-        '<th>代號</th><th>名稱</th><th>加分</th><th>綜排</th><th>距月線</th>'
+        '<th>排名</th><th>代號</th><th>名稱</th><th>加分</th><th>綜排</th><th>距月線</th>'
         '<th>KD (K/D)</th><th>RSI</th><th>MACD柱</th><th>布林%b</th><th>量比</th>'
         '<th>加分缺項</th><th>延伸過度提醒</th>'
         f'</tr></thead><tbody>{body_rows}</tbody></table></div>'
     )
     return ('<div class="panel"><h2>技術面交集</h2>' + head + blocks +
             '<p class="subtle">交集只描述技術面目前的狀態，不含未來報酬的統計驗證；'
-            '本清單未做過勝率回測，請當作篩選起點而非買賣訊號。</p></div>')
+            '本清單未做過勝率回測，請當作篩選起點而非買賣訊號。'
+            '排名依「延伸過度警訊少 → 加分項多 → 綜合排名前」，'
+            '反映今日技術面型態的乾淨程度，不是報酬預測。</p></div>')
 
 
 def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:

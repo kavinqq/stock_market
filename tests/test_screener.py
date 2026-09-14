@@ -322,3 +322,48 @@ def test_condition_labels_describe_what_is_actually_tested():
     assert "金叉" not in texts
     assert "K ≥ D" in texts
     assert "翻多" not in texts
+
+
+# ---------------------------------------------------------------------------
+# Ranking the shortlist
+# ---------------------------------------------------------------------------
+
+def _cand(code, warnings, bonus_passed, rank):
+    return {"code": code, "rank": rank,
+            "intersection": {"is_candidate": True,
+                             "warnings": ["w"] * warnings,
+                             "bonus_passed": bonus_passed, "bonus_total": 3}}
+
+
+def test_ranking_puts_the_least_extended_setup_first():
+    """Fewer stretch warnings ranks higher even against a better composite: a
+    screen exists to find room left to run, not to confirm a stock already ran."""
+    ranked = screener.rank_candidates([_cand("A", 2, 3, 1), _cand("B", 0, 3, 40)])
+    assert [r["code"] for r in ranked] == ["B", "A"]
+
+
+def test_bonus_count_breaks_ties_on_warnings():
+    ranked = screener.rank_candidates([_cand("A", 1, 2, 5), _cand("B", 1, 3, 30)])
+    assert [r["code"] for r in ranked] == ["B", "A"]
+
+
+def test_composite_rank_breaks_remaining_ties():
+    ranked = screener.rank_candidates([_cand("A", 1, 3, 30), _cand("B", 1, 3, 5)])
+    assert [r["code"] for r in ranked] == ["B", "A"]
+
+
+def test_ranking_assigns_positions_and_keeps_only_candidates():
+    rows = [_cand("A", 0, 3, 2), _cand("B", 1, 3, 1)]
+    rows.append({"code": "C", "rank": 3,
+                 "intersection": {"is_candidate": False, "warnings": [],
+                                  "bonus_passed": 3, "bonus_total": 3}})
+    ranked = screener.rank_candidates(rows)
+    assert [r["code"] for r in ranked] == ["A", "B"]
+    assert [r["intersection"]["shortlist_rank"] for r in ranked] == [1, 2]
+
+
+def test_ranking_is_stable_and_does_not_mutate_input_order():
+    rows = [_cand("A", 1, 3, 5), _cand("B", 0, 3, 9)]
+    original = [r["code"] for r in rows]
+    screener.rank_candidates(rows)
+    assert [r["code"] for r in rows] == original

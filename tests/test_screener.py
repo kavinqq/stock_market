@@ -367,3 +367,51 @@ def test_ranking_is_stable_and_does_not_mutate_input_order():
     original = [r["code"] for r in rows]
     screener.rank_candidates(rows)
     assert [r["code"] for r in rows] == original
+
+
+# ---------------------------------------------------------------------------
+# Valuation fallback (added 2026-09-14)
+# ---------------------------------------------------------------------------
+
+_HIST = {
+    "2357": [{"date": "2026-09-10", "pe": 13.0, "pb": 2.2, "dividend_yield": 4.5},
+             {"date": "2026-09-11", "pe": 13.51, "pb": 2.28, "dividend_yield": 4.55}],
+    "2882": [{"date": "2026-09-11", "pe": 13.03, "pb": 1.5, "dividend_yield": 3.0}],
+    "9999": [],
+}
+
+
+def test_live_valuation_is_used_when_present_and_marked_fresh():
+    merged = screener.merge_valuation_with_fallback(
+        ["2357"], {"2357": {"pe": 14.0, "pb": 2.3, "dividend_yield": 4.4}},
+        _HIST, asof="2026-09-14")
+    assert merged["2357"]["pe"] == 14.0
+    assert merged["2357"]["valuation_asof"] == "2026-09-14"
+    assert merged["2357"]["valuation_is_stale"] is False
+
+
+def test_missing_live_valuation_falls_back_to_the_last_stored_row():
+    """The batch fetch walks back only three days, so every Monday report lost
+    the valuation facet entirely — weight 0.30 silently renormalized away."""
+    merged = screener.merge_valuation_with_fallback(
+        ["2357", "2882"], {}, _HIST, asof="2026-09-14")
+    assert merged["2357"]["pe"] == 13.51          # the 09-11 row, not 09-10
+    assert merged["2357"]["valuation_asof"] == "2026-09-11"
+    assert merged["2357"]["valuation_is_stale"] is True
+    assert merged["2882"]["pb"] == 1.5
+
+
+def test_fallback_reports_nothing_rather_than_inventing_a_value():
+    merged = screener.merge_valuation_with_fallback(
+        ["9999", "8888"], {}, _HIST, asof="2026-09-14")
+    assert merged.get("9999") in (None, {})
+    assert merged.get("8888") in (None, {})
+
+
+def test_fallback_does_not_overwrite_a_partial_live_row():
+    """A live row missing PB should keep its live PE, not be swapped wholesale."""
+    merged = screener.merge_valuation_with_fallback(
+        ["2357"], {"2357": {"pe": 14.0, "pb": None, "dividend_yield": None}},
+        _HIST, asof="2026-09-14")
+    assert merged["2357"]["pe"] == 14.0
+    assert merged["2357"]["valuation_is_stale"] is False

@@ -1,4 +1,8 @@
 import unittest
+
+import pytest
+
+from marketlib import stocks
 from marketlib.stocks import _parse_stock_day, _parse_t86, _parse_bwibbu, _parse_monthly_revenue
 from marketlib.stocks import ema, macd, rsi, resample_weekly, technical_metrics
 from marketlib.stocks import percentile_rank, valuation_metrics, revenue_metrics
@@ -534,3 +538,84 @@ class TestNamesAndResolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Valuation band — the "河流圖 便宜還是貴" question (added 2026-09-14)
+# ---------------------------------------------------------------------------
+
+def test_valuation_band_places_a_value_in_its_own_history():
+    hist = [float(x) for x in range(1, 101)]  # 1..100
+    cheap = stocks.valuation_band(10.0, hist, min_history=100)
+    assert cheap["percentile"] == pytest.approx(0.10)
+    assert cheap["band"] == "極便宜"
+    assert stocks.valuation_band(50.0, hist, min_history=100)["band"] == "合理"
+    assert stocks.valuation_band(95.0, hist, min_history=100)["band"] == "昂貴"
+
+
+def test_valuation_band_needs_enough_history_to_mean_anything():
+    """A percentile over a handful of points is noise wearing a label."""
+    assert stocks.valuation_band(10.0, [8.0, 9.0, 12.0]) is None
+    assert stocks.valuation_band(None, [float(x) for x in range(1, 101)]) is None
+    # Real default: one trading year. 100 points is not enough for a verdict.
+    assert stocks.valuation_band(10.0, [float(x) for x in range(1, 101)]) is None
+
+
+def test_valuation_band_honours_the_lookback_window():
+    """Eleven years of history spans regimes that no longer apply; the band is
+    measured against a recent window, not the whole record."""
+    old_cheap = [1.0] * 500
+    recent_expensive = [100.0] * 500
+    band = stocks.valuation_band(50.0, old_cheap + recent_expensive, lookback=500,
+                                 min_history=500)
+    assert band["percentile"] == pytest.approx(0.0)
+    assert band["sample_size"] == 500
+
+
+def test_financial_stocks_are_valued_on_pb_not_pe():
+    """PE for a Taiwanese financial holding is distorted by one-off investment
+    gains; PB is the metric the market actually uses."""
+    hist = list(range(1, 101))
+    r = stocks.river_valuation("2882", pe=90.0, pb=10.0,
+                               pe_history=[float(x) for x in hist],
+                               pb_history=[float(x) for x in hist],
+                               min_history=100)
+    assert r["primary_metric"] == "PB"
+    assert r["band"] == "極便宜"          # driven by pb=10, not pe=90
+    assert r["pe_band"]["band"] == "昂貴"  # both still reported
+
+
+def test_non_financial_leads_with_pe():
+    hist = [float(x) for x in range(1, 101)]
+    r = stocks.river_valuation("2357", min_history=100, pe=10.0, pb=90.0,
+                               pe_history=hist, pb_history=hist)
+    assert r["primary_metric"] == "PE"
+    assert r["band"] == "極便宜"
+
+
+def test_missing_pe_falls_back_to_pb_rather_than_reporting_nothing():
+    """1101 台泥 had no usable PE on 2026-09-14 but a perfectly good PB."""
+    hist = [float(x) for x in range(1, 101)]
+    r = stocks.river_valuation("1101", min_history=100, pe=None, pb=20.0,
+                               pe_history=hist, pb_history=hist)
+    assert r["primary_metric"] == "PB"
+    assert r["band"] == "便宜"
+
+
+def test_cyclical_stocks_carry_a_value_trap_caveat():
+    """A cyclical at peak earnings shows its LOWEST trailing PE right at the
+    top, so a bare "cheap" reading is actively misleading for these."""
+    hist = [float(x) for x in range(1, 101)]
+    r = stocks.river_valuation("1303", min_history=100, pe=10.0, pb=50.0,
+                               pe_history=hist, pb_history=hist)
+    assert any("循環" in c for c in r["caveats"])
+    plain = stocks.river_valuation("2357", min_history=100, pe=10.0, pb=50.0,
+                                   pe_history=hist, pb_history=hist)
+    assert not any("循環" in c for c in plain["caveats"])
+
+
+def test_no_usable_valuation_returns_an_explicit_unknown():
+    r = stocks.river_valuation("9999", pe=None, pb=None,
+                               pe_history=[], pb_history=[])
+    assert r["band"] is None
+    assert r["primary_metric"] is None

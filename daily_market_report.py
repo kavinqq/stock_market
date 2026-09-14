@@ -1271,15 +1271,27 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
         "排名反映**今日技術面型態的乾淨程度**，不是報酬預測，也未做過勝率回測："
     )
     lines.append("")
-    lines.append("| 排名 | 代號 | 名稱 | 警訊 | 加分 | 綜排 | 距月線 | KD (K/D) | RSI | MACD柱 | 布林%b | 量比 |")
-    lines.append("|------|------|------|------|------|------|--------|----------|-----|--------|--------|------|")
+    lines.append(
+        "| 排名 | 代號 | 名稱 | 股價 | 河流圖位階 | 分位 | 本益比 | 股價淨值比 "
+        "| 警訊 | 加分 | 綜排 | 距月線 | KD (K/D) | RSI | MACD柱 | 布林%b | 量比 |"
+    )
+    lines.append(
+        "|------|------|------|------|------------|------|--------|------------"
+        "|------|------|------|--------|----------|-----|--------|--------|------|"
+    )
     for r in hits:
         ins = r["intersection"]
         m = ins["metrics_snapshot"]
         kd_str = (f"{m['kd_k']:.0f}/{m['kd_d']:.0f}"
                   if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
+        riv = r.get("river") or {}
+        band = riv.get("band")
+        band_str = (f"{band}（{riv.get('primary_metric')}）" if band else "資料不足")
+        pct_str = (f"{riv['percentile']:.0%}" if riv.get("percentile") is not None else "—")
         lines.append(
             f"| **{ins.get('shortlist_rank','—')}** | {r.get('code','')} | {r.get('name','')} "
+            f"| {fmt_num(m.get('close'), 2)} | {band_str} | {pct_str} "
+            f"| {fmt_num(riv.get('pe'), 2)} | {fmt_num(riv.get('pb'), 2)} "
             f"| {'⚠️ ' + str(len(ins['warnings'])) if ins['warnings'] else '—'} "
             f"| {ins['bonus_passed']}/{ins['bonus_total']} | {r.get('rank','—')} "
             f"| {fmt_pct(m.get('close_vs_ma20'))} | {kd_str} "
@@ -1287,6 +1299,42 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
             f"| {fmt_num(m.get('pctb'), 2)} | {fmt_num(m.get('volume_ratio_20d'), 2)} |"
         )
     lines.append("")
+    banded = [r for r in hits if (r.get("river") or {}).get("percentile") is not None]
+    rich = [r for r in banded if r["river"]["percentile"] >= 0.80]
+    cheap = [r for r in banded if r["river"]["percentile"] < 0.20]
+    lines.append(
+        "河流圖位階 = 今日估值在該股**自身近 5 年**分布中的百分位（分位越低越便宜）。"
+        "金融股與無可用 PE 者改以 PB 判讀，括號內為實際採用的指標。"
+    )
+    if banded:
+        # The distribution is the finding: a technical screen run in a strong
+        # tape naturally surfaces stocks that are already richly valued, and the
+        # count says how much of that is happening today.
+        lines.append("")
+        lines.append(
+            f"**{len(banded)} 檔可判讀估值中，{len(rich)} 檔位於自身 5 年分位 80% 以上"
+            f"（昂貴區），{len(cheap)} 檔在 20% 以下（便宜區）。**"
+            + ("技術面通過交集與估值便宜是兩件事，本清單同時符合者為："
+               + "、".join(f"{r.get('code','')} {r.get('name','')}" for r in cheap)
+               + "。" if cheap else "")
+        )
+    stale = [r for r in hits if (r.get("river") or {}).get("is_stale")]
+    if stale:
+        asof = sorted({r["river"].get("asof") for r in stale if r["river"].get("asof")})
+        lines.append("")
+        lines.append(
+            f"> 估值資料為 {('、'.join(asof) if asof else '前一交易日')} 收盤（今日尚未公布），"
+            f"價量指標則為最新。"
+        )
+    lines.append("")
+    val_caveats = [(r, (r.get("river") or {}).get("caveats") or []) for r in hits]
+    val_caveats = [(r, c) for r, c in val_caveats if c]
+    if val_caveats:
+        lines.append("估值判讀注意事項：")
+        for r, cav in val_caveats:
+            lines.append(f"- **{r.get('code','')} {r.get('name','')}** — " + "；".join(cav))
+        lines.append("")
+
     flagged = [r for r in hits if r["intersection"]["warnings"]]
     if flagged:
         lines.append("⚠️ 延伸過度提醒（條件仍成立，但屬追高風險，是否進場請自行判斷）：")
@@ -2410,6 +2458,7 @@ def assemble_screener(
             "ret20": tech.get("ret20"),
             "ret60": tech.get("ret60"),
             "intersection": tech.get("intersection"),
+            "river": tech.get("river"),
         })
     ranked = _screener.build_screener(records)
     # Re-attach name and the technical intersection to ranked rows (build_screener
@@ -2420,6 +2469,7 @@ def assemble_screener(
         if "name" not in row or not row["name"]:
             row["name"] = src.get("name", row.get("code", ""))
         row["intersection"] = src.get("intersection")
+        row["river"] = src.get("river")
     return ranked
 
 
@@ -2435,6 +2485,14 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
     """
     codes = TW50_CONSTITUENTS
     end_iso = end.isoformat()
+    # Stored valuation history, read once: it backs both the river band and the
+    # stale-row fallback below.
+    valuation_history: dict[str, list[dict]] = {}
+    for c in codes:
+        try:
+            valuation_history[c] = store.get_stock_valuation(c) or []
+        except Exception:  # noqa: BLE001
+            valuation_history[c] = []
 
     # --- Batch fetch: valuation, T86 chip, revenue (ONE request each) ---
     # For valuation and T86: try latest date, fall back to prior day if empty
@@ -2449,6 +2507,12 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                 break
     except Exception:  # noqa: BLE001
         valuation_by_code = {}
+
+    # A Monday (or post-holiday) fetch finds nothing in a three-day window, which
+    # used to drop the valuation facet entirely. Carry the last stored row
+    # forward instead, stamped with its real date.
+    valuation_by_code = _screener.merge_valuation_with_fallback(
+        codes, valuation_by_code, valuation_history, asof=end_iso)
 
     try:
         for delta in range(3):
@@ -2532,6 +2596,23 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                     "ret60": tech_m.get("ret60"),
                     "intersection": _screener.technical_intersection(tech_m),
                 }
+                # Where today's multiple sits inside this stock's own recent
+                # range — the question a PE river chart answers by eye.
+                try:
+                    hist = valuation_history.get(code) or []
+                    val_now = valuation_by_code.get(code) or {}
+                    tech_by_code[code]["river"] = _stocks.river_valuation(
+                        code,
+                        pe=val_now.get("pe"),
+                        pb=val_now.get("pb"),
+                        pe_history=[r.get("pe") for r in hist],
+                        pb_history=[r.get("pb") for r in hist],
+                    )
+                    tech_by_code[code]["river"]["asof"] = val_now.get("valuation_asof")
+                    tech_by_code[code]["river"]["is_stale"] = val_now.get(
+                        "valuation_is_stale")
+                except Exception:  # noqa: BLE001 — valuation never blocks the screen
+                    tech_by_code[code]["river"] = None
         except Exception:  # noqa: BLE001
             # One failure never aborts the whole screener
             pass
@@ -2580,9 +2661,17 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
         kd_str = (f'{m["kd_k"]:.0f}/{m["kd_d"]:.0f}'
                   if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
         missing = "；".join(ins["bonus_failed"])
+        riv = r.get("river") or {}
+        band = riv.get("band")
+        band_str = (f'{band}（{riv.get("primary_metric")}）' if band else "資料不足")
+        pct_str = (f'{riv["percentile"]:.0%}' if riv.get("percentile") is not None else "—")
         body_rows += (
             f'<tr><td><strong>{ins.get("shortlist_rank","—")}</strong></td>'
             f'<td>{esc(r.get("code",""))}</td><td>{esc(r.get("name",""))}</td>'
+            f'<td>{esc(fmt_num(m.get("close"), 2))}</td>'
+            f'<td>{esc(band_str)}</td><td>{esc(pct_str)}</td>'
+            f'<td>{esc(fmt_num(riv.get("pe"), 2))}</td>'
+            f'<td>{esc(fmt_num(riv.get("pb"), 2))}</td>'
             f'<td>{ins["bonus_passed"]}/{ins["bonus_total"]}</td>'
             f'<td>{r.get("rank","—")}</td>'
             f'<td>{esc(fmt_pct(m.get("close_vs_ma20")))}</td>'
@@ -2596,7 +2685,9 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
         )
     blocks = (
         '<div style="overflow-x:auto"><table><thead><tr>'
-        '<th>排名</th><th>代號</th><th>名稱</th><th>加分</th><th>綜排</th><th>距月線</th>'
+        '<th>排名</th><th>代號</th><th>名稱</th><th>股價</th>'
+        '<th>河流圖位階</th><th>分位</th><th>本益比</th><th>股價淨值比</th>'
+        '<th>加分</th><th>綜排</th><th>距月線</th>'
         '<th>KD (K/D)</th><th>RSI</th><th>MACD柱</th><th>布林%b</th><th>量比</th>'
         '<th>加分缺項</th><th>延伸過度提醒</th>'
         f'</tr></thead><tbody>{body_rows}</tbody></table></div>'
@@ -2605,7 +2696,9 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
             '<p class="subtle">交集只描述技術面目前的狀態，不含未來報酬的統計驗證；'
             '本清單未做過勝率回測，請當作篩選起點而非買賣訊號。'
             '排名依「延伸過度警訊少 → 加分項多 → 綜合排名前」，'
-            '反映今日技術面型態的乾淨程度，不是報酬預測。</p></div>')
+            '反映今日技術面型態的乾淨程度，不是報酬預測。'
+            '河流圖位階為該股自身近 5 年估值分布的百分位（越低越便宜）；'
+            '金融股與無可用 PE 者改以 PB 判讀。</p></div>')
 
 
 def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:

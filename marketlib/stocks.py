@@ -1532,3 +1532,124 @@ def build_2330_scorecard(
         "medium_lean": medium_lean,
         "missing": missing,
     }
+
+
+# ---------------------------------------------------------------------------
+# Valuation band — "河流圖上現在算便宜還是貴"
+#
+# A PE river chart answers one question visually: where does today's valuation
+# sit inside this stock's own historical range? That is a percentile, so we
+# compute the percentile directly rather than drawing bands and eyeballing them.
+# ---------------------------------------------------------------------------
+
+# Trading days in the lookback. Eleven years of stored history spans regimes
+# that no longer price the same way; five years is the window Taiwanese river
+# charts conventionally use.
+VALUATION_LOOKBACK_DAYS = 1250
+MIN_VALUATION_BAND_HISTORY = 250
+
+VALUATION_BANDS: list[tuple[float, str]] = [
+    (0.20, "極便宜"),
+    (0.40, "便宜"),
+    (0.60, "合理"),
+    (0.80, "偏貴"),
+    (1.01, "昂貴"),
+]
+
+# Taiwanese financial holdings: 28xx, plus 5880 合庫金 and 5876 上海商銀.
+# Their PE swings on one-off investment gains, so the market reads them on PB.
+_FINANCIAL_CODES = {"5880", "5876"}
+
+# Petrochemical, steel, shipping, cement — deep cyclicals whose trailing PE is
+# LOWEST at the earnings peak, which is usually the worst moment to buy. A bare
+# "cheap" reading on these is the classic value trap, so it ships with a caveat.
+_CYCLICAL_CODES = {"1301", "1303", "1326", "1101", "1102", "2002",
+                   "2603", "2609", "2615"}
+
+
+def _is_financial(code: str) -> bool:
+    return code.startswith("28") or code in _FINANCIAL_CODES
+
+
+def valuation_band(
+    value: Optional[float],
+    history: list[float],
+    lookback: int = VALUATION_LOOKBACK_DAYS,
+    min_history: int = MIN_VALUATION_BAND_HISTORY,
+) -> Optional[dict[str, Any]]:
+    """Where `value` sits inside its own recent history.
+
+    Returns ``{"percentile", "band", "sample_size", "low", "high"}``, or None
+    when there is no value or too little history — a percentile over a handful
+    of points is noise wearing a label, and would read as a real verdict.
+
+    Lower percentile = cheaper, for both PE and PB.
+    """
+    clean = [h for h in history if h is not None and h > 0]
+    if value is None or value <= 0:
+        return None
+    window = clean[-lookback:] if lookback else clean
+    if len(window) < min_history:
+        return None
+    pct = percentile_rank(window, value)
+    band = next(label for edge, label in VALUATION_BANDS if pct < edge)
+    ordered = sorted(window)
+    return {
+        "percentile": pct,
+        "band": band,
+        "sample_size": len(window),
+        "low": ordered[0],
+        "high": ordered[-1],
+    }
+
+
+def river_valuation(
+    code: str,
+    pe: Optional[float],
+    pb: Optional[float],
+    pe_history: list[float],
+    pb_history: list[float],
+    lookback: int = VALUATION_LOOKBACK_DAYS,
+    min_history: int = MIN_VALUATION_BAND_HISTORY,
+) -> dict[str, Any]:
+    """The cheap-or-expensive verdict, on whichever multiple actually applies.
+
+    PE leads for an ordinary operating company. PB leads for a financial
+    holding, whose PE moves with one-off investment gains rather than with the
+    business, and PB also stands in whenever PE is unusable (a loss-making
+    quarter leaves 1101 台泥 with no PE at all).
+
+    Both bands are always returned, so the reader can see the two disagree when
+    they do, and `caveats` carries the reasons this reading may mislead.
+    """
+    pe_band = valuation_band(pe, pe_history, lookback, min_history)
+    pb_band = valuation_band(pb, pb_history, lookback, min_history)
+
+    financial = _is_financial(code)
+    prefer_pb = financial or pe_band is None
+    primary = pb_band if prefer_pb else pe_band
+    metric = None if primary is None else ("PB" if prefer_pb else "PE")
+
+    caveats: list[str] = []
+    if financial:
+        caveats.append("金融股以 PB 判讀，PE 易受一次性投資損益扭曲")
+    elif pe_band is None and pb_band is not None:
+        caveats.append("近四季無可用 PE（可能為虧損或資料缺漏），改以 PB 判讀")
+    if code in _CYCLICAL_CODES:
+        caveats.append(
+            "循環股：獲利高峰時 trailing PE 最低，河流圖顯示「便宜」常出現在景氣頂部"
+        )
+    if primary is not None and primary["percentile"] < 0.20:
+        caveats.append("低分位也可能是市場已在反映獲利衰退，非必然便宜")
+
+    return {
+        "primary_metric": metric,
+        "band": None if primary is None else primary["band"],
+        "percentile": None if primary is None else primary["percentile"],
+        "sample_size": None if primary is None else primary["sample_size"],
+        "pe": pe,
+        "pb": pb,
+        "pe_band": pe_band,
+        "pb_band": pb_band,
+        "caveats": caveats,
+    }

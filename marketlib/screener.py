@@ -421,3 +421,42 @@ def rank_candidates(rows: list[dict]) -> list[dict]:
     for position, row in enumerate(ordered, start=1):
         row["intersection"]["shortlist_rank"] = position
     return ordered
+
+
+def merge_valuation_with_fallback(
+    codes: list[str],
+    fetched: dict[str, dict],
+    history_by_code: dict[str, list[dict]],
+    asof: Optional[str] = None,
+) -> dict[str, dict]:
+    """Live valuation where available, last stored row otherwise, dated either way.
+
+    The batch fetch tries only the last three calendar days, so on a Monday —
+    or after any long weekend — it finds nothing and the valuation facet
+    (weight 0.30) was silently renormalized out of the composite, and the river
+    band read 資料不足 for every stock. Widening the fetch window only moves the
+    cliff; falling back to what the store already holds removes it.
+
+    Every row is stamped with ``valuation_asof`` and ``valuation_is_stale`` so a
+    carried-forward multiple can never pass as today's. Codes with neither a
+    live nor a stored row are simply absent — never filled with a guess.
+    """
+    out: dict[str, dict] = {}
+    for code in codes:
+        live = fetched.get(code)
+        if live:
+            out[code] = {**live, "valuation_asof": asof, "valuation_is_stale": False}
+            continue
+        rows = [r for r in (history_by_code.get(code) or [])
+                if r.get("pe") is not None or r.get("pb") is not None]
+        if not rows:
+            continue
+        last = max(rows, key=lambda r: r.get("date") or "")
+        out[code] = {
+            "pe": last.get("pe"),
+            "pb": last.get("pb"),
+            "dividend_yield": last.get("dividend_yield"),
+            "valuation_asof": last.get("date"),
+            "valuation_is_stale": True,
+        }
+    return out

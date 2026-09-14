@@ -695,9 +695,18 @@ def test_split_in_the_valuation_series_is_detected_by_matching_ratios():
     as "cheapest in five years".
     """
     rows = [
+        # Three stable sessions before the break — medians on both sides are what
+        # tell a split from a one-day bad row.
+        {"date": "2026-08-27", "pe": 21.85, "pb": 9.28, "dividend_yield": 2.41},
+        {"date": "2026-08-28", "pe": 23.08, "pb": 9.80, "dividend_yield": 2.28},
+        {"date": "2026-08-31", "pe": 22.75, "pb": 9.66, "dividend_yield": 2.31},
         {"date": "2026-09-01", "pe": 25.01, "pb": 10.62, "dividend_yield": 2.11},
         {"date": "2026-09-02", "pe": 8.37, "pb": 3.55, "dividend_yield": 6.29},
+        # The restated level has to hold — that is what tells a split apart from
+        # a one-day bad row in TWSE's feed.
         {"date": "2026-09-03", "pe": 7.93, "pb": 3.37, "dividend_yield": 6.64},
+        {"date": "2026-09-04", "pe": 8.22, "pb": 3.49, "dividend_yield": 6.40},
+        {"date": "2026-09-07", "pe": 7.98, "pb": 3.39, "dividend_yield": 6.60},
     ]
     found = stocks.detect_valuation_splits(rows)
     assert len(found) == 1
@@ -749,3 +758,65 @@ def test_river_valuation_is_unchanged_when_there_is_no_split():
     b = stocks.river_valuation("2357", min_history=100, pe=20.0, pb=20.0,
                                pe_history=hist, pb_history=hist, splits=[])
     assert a["band"] == b["band"] and a["band"] is not None
+
+
+def test_a_one_day_valuation_glitch_is_not_a_split():
+    """TWSE's BWIBBU feed publishes the occasional bad row. 5880 合庫金 on
+    2025-08-01 read PE 13.52 / PB 1.01 between two days at ~20.5 / ~1.50, while
+    the price ran 25.40 → 25.65 → 25.90 without a break. Comparing only
+    consecutive days called the RECOVERY a split — and reported an impossible
+    0.66:1 factor, since a split can only ever lower PE.
+    """
+    rows = [
+        {"date": "2025-07-30", "pe": 20.69, "pb": 1.51},
+        {"date": "2025-07-31", "pe": 20.48, "pb": 1.49},
+        {"date": "2025-08-01", "pe": 13.52, "pb": 1.01},
+        {"date": "2025-08-04", "pe": 20.89, "pb": 1.52},
+        {"date": "2025-08-05", "pe": 21.01, "pb": 1.53},
+        {"date": "2025-08-06", "pe": 21.25, "pb": 1.55},
+    ]
+    assert stocks.detect_valuation_splits(rows) == []
+
+
+def test_a_real_split_persists_and_is_still_detected():
+    """6669 on 2026-09-02: the new level holds for every following day."""
+    rows = [
+        {"date": "2026-08-27", "pe": 21.85, "pb": 9.28},
+        {"date": "2026-08-28", "pe": 23.08, "pb": 9.80},
+        {"date": "2026-08-31", "pe": 22.75, "pb": 9.66},
+        {"date": "2026-09-01", "pe": 25.01, "pb": 10.62},
+        {"date": "2026-09-02", "pe": 8.37, "pb": 3.55},
+        {"date": "2026-09-03", "pe": 7.93, "pb": 3.37},
+        {"date": "2026-09-04", "pe": 8.22, "pb": 3.49},
+        {"date": "2026-09-07", "pe": 7.98, "pb": 3.39},
+    ]
+    found = stocks.detect_valuation_splits(rows)
+    assert len(found) == 1 and found[0]["date"] == "2026-09-02"
+
+
+def test_a_split_factor_below_one_is_never_reported():
+    """Share count only goes up in a split, so PE can only fall. A factor under
+    1 means the data moved the other way and is not a split."""
+    rows = [{"date": "2026-01-01", "pe": 10.0, "pb": 1.0}] + [
+        {"date": f"2026-01-{d:02d}", "pe": 15.0, "pb": 1.5} for d in range(2, 8)]
+    assert stocks.detect_valuation_splits(rows) == []
+
+
+def test_a_glitch_on_the_day_BEFORE_is_not_a_split_either():
+    """2890 永豐金: 11.89, 12.14, **16.91**, 12.34, 12.23, 12.60.
+
+    Checking only that the NEW level persists treats the spike as the old level
+    and the return to normal as a split that sticks. The level before the break
+    has to be stable too, so both sides are compared on medians — one bad row
+    cannot move a median.
+    """
+    rows = [
+        {"date": "2025-04-25", "pe": 11.80, "pb": 1.27},
+        {"date": "2025-04-28", "pe": 11.89, "pb": 1.28},
+        {"date": "2025-04-29", "pe": 12.14, "pb": 1.31},
+        {"date": "2025-04-30", "pe": 16.91, "pb": 1.76},
+        {"date": "2025-05-02", "pe": 12.34, "pb": 1.33},
+        {"date": "2025-05-05", "pe": 12.23, "pb": 1.32},
+        {"date": "2025-05-06", "pe": 12.60, "pb": 1.36},
+    ]
+    assert stocks.detect_valuation_splits(rows) == []

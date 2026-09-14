@@ -73,21 +73,19 @@ def refresh(db: str, months: int, max_requests: int, sleep: float,
                 bars = ns.fetch_stock_day(code, m)
                 spent += 1
                 if not bars:
-                    # Empty is only a real answer for a month before this stock
-                    # was listed. For any later month it means TWSE returned
-                    # nothing this time — and marking that as done would skip it
-                    # permanently. Sixteen stocks silently stayed on 09-01 bars
-                    # that way, which is the exact failure this script exists to
-                    # prevent.
-                    known = store.get_stock_daily(code)
-                    pre_listing = bool(known) and m.strftime("%Y-%m") < known[0]["date"][:7]
-                    if pre_listing or not known:
-                        store.mark_ingested("stock_day", key)
-                    else:
-                        blocked += 1
-                        consecutive_fail += 1
-                        print(f"  ?? {code} {m:%Y-%m}: 回傳空值，不標記完成（下輪重試）",
-                              flush=True)
+                    # An empty month is NEVER recorded as done. The obvious
+                    # shortcut — treat "older than this stock's earliest bar" as
+                    # pre-listing — is circular: those bars are missing precisely
+                    # because we never fetched them, so it froze ten TW50
+                    # large-caps at 136 bars by concluding 富邦金 was not listed
+                    # before March 2026. Every constituent here has years of
+                    # history, so an empty month is a transient TWSE response and
+                    # is retried on the next run; the request budget and the
+                    # consecutive-failure guard are what bound the retrying.
+                    blocked += 1
+                    consecutive_fail += 1
+                    print(f"  ?? {code} {m:%Y-%m}: 回傳空值，不標記完成（下輪重試）",
+                          flush=True)
                     continue
                 consecutive_fail = 0
                 for bar in bars:

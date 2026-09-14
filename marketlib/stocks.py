@@ -7,7 +7,7 @@ returning None / [] on any failure — never raise to caller.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Optional
 
 from marketlib.core import MarketBar, clean_num, pct_change  # noqa: F401
@@ -1769,6 +1769,10 @@ def last_completed_trading_day(today: date, now=None) -> date:
 # smallest split worth worrying about.
 _SPLIT_MIN_FACTOR_DEVIATION = 0.20
 _SPLIT_RATIO_AGREEMENT = 0.05
+# Sessions the restated level must hold for before it counts as a split rather
+# than a bad row, and how far it may drift over them.
+_SPLIT_PERSISTENCE_ROWS = 3
+_SPLIT_PERSISTENCE_TOL = 0.15
 
 
 def detect_valuation_splits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1784,18 +1788,46 @@ def detect_valuation_splits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     because the number is wrong.
     """
     out: list[dict[str, Any]] = []
-    for prev, cur in zip(rows, rows[1:]):
+    for i in range(1, len(rows)):
+        prev, cur = rows[i - 1], rows[i]
         pe0, pe1 = prev.get("pe"), cur.get("pe")
         pb0, pb1 = prev.get("pb"), cur.get("pb")
         if not all(isinstance(v, (int, float)) and v > 0 for v in (pe0, pe1, pb0, pb1)):
             continue
         pe_ratio, pb_ratio = pe0 / pe1, pb0 / pb1
-        if abs(pe_ratio - 1) < _SPLIT_MIN_FACTOR_DEVIATION:
+        # A split raises the share count, so PE and PB can only fall: factor > 1.
+        # Anything below that is the data moving the other way.
+        if pe_ratio < 1 + _SPLIT_MIN_FACTOR_DEVIATION:
             continue
-        # Both multiples must move together, in the same direction, by the same
-        # factor — otherwise it is a re-rating, which is real information.
+        # Both multiples must move together by the same factor — a re-rating
+        # moves them independently.
         if abs(pe_ratio - pb_ratio) / max(pe_ratio, pb_ratio) > _SPLIT_RATIO_AGREEMENT:
             continue
+        # The level must be stable on BOTH sides, compared on medians so a
+        # single bad row cannot pass for a level. TWSE's feed prints occasional
+        # one-day outliers: 5880 showed PE 13.52 between two days at ~20.5, and
+        # 2890 showed 16.91 between days at ~12. Checking only that the NEW
+        # level sticks mistakes the spike for the old level and the return to
+        # normal for a split — which is how an impossible 0.66:1 "split" got
+        # reported. A real split moves both medians and neither comes back.
+        k = _SPLIT_PERSISTENCE_ROWS
+        before = [r["pe"] for r in rows[max(0, i - k): i]
+                  if isinstance(r.get("pe"), (int, float)) and r["pe"] > 0]
+        after = [r["pe"] for r in rows[i: i + k]
+                 if isinstance(r.get("pe"), (int, float)) and r["pe"] > 0]
+        if len(before) < k or len(after) < k:
+            continue
+        med_ratio = median(before) / median(after)
+        if med_ratio < 1 + _SPLIT_MIN_FACTOR_DEVIATION:
+            continue
+        if abs(med_ratio - pe_ratio) / pe_ratio > _SPLIT_PERSISTENCE_TOL:
+            continue
+        # Medians decide WHETHER this is a split (robust to a bad row); the
+        # consecutive-day ratio reports HOW BIG it was, since the restatement
+        # happened between exactly those two sessions. A drifting pre-split
+        # level pulls the median away from the true factor — 2.81 vs 2.99 for
+        # 6669's 3:1.
         out.append({"date": cur["date"], "factor": (pe_ratio + pb_ratio) / 2,
+                    "median_ratio": med_ratio,
                     "pe_ratio": pe_ratio, "pb_ratio": pb_ratio})
     return out

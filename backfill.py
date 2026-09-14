@@ -336,14 +336,21 @@ def backfill_valuation(store, ns, codes, dates, budget=None,
             time.sleep(sleep + random.uniform(0, 0.5))
 
 def backfill_stock_day_month(store, ns, stock_no: str, month_start: date,
-                             budget=None, sleep: float = 1.5) -> None:
+                             budget=None, sleep: float = 1.5,
+                             force: bool = False) -> None:
     """Fetch one month of STOCK_DAY for stock_no and upsert into stock_daily.
 
     Resume key: ingest_log("stock_day", "stock_day:<stock_no>:<YYYY-MM>").
     budget.spend() is called once per fetch; BudgetExhausted propagates.
+
+    `force` ignores the resume marker. A month that is still being written must
+    be re-fetched every run: September's marker was set on the 1st, so every
+    TW50 constituent's bars stopped at 2026-09-01 and the screener published
+    nine-session-old prices for the rest of the month. The marker is a resume
+    aid for finished history, not a statement that a live month is complete.
     """
     key = f"stock_day:{stock_no}:{month_start.strftime('%Y-%m')}"
-    if store.is_ingested("stock_day", key):
+    if not force and store.is_ingested("stock_day", key):
         return
     _spend(budget)
     bars = ns.fetch_stock_day(stock_no, month_start)
@@ -363,6 +370,13 @@ def backfill_stock_day_month(store, ns, stock_no: str, month_start: date,
     store.mark_ingested("stock_day", key)
     if sleep:
         time.sleep(sleep + random.uniform(0, 0.5))
+
+# Months re-fetched on every run regardless of the resume marker: the current
+# one is still being written, and the previous one can gain late corrections.
+RECENT_MONTHS_ALWAYS_REFRESHED = 2
+# Depth target for per-stock bars — enough for MA240 and a converged weekly MACD.
+STOCK_DAY_TARGET_MONTHS = 24
+
 
 def incremental_run(store, ns, start: date, budget: Budget,
                     sleep: float = 1.5, max_retries: int = 3,
@@ -393,6 +407,15 @@ def incremental_run(store, ns, start: date, budget: Budget,
     trading_dates = [r[0] for r in rows]
 
     try:
+        # --- P0: refresh the months still being written, before anything else ---
+        # Priority is deliberate. A stale bar breaks TODAY's report; a missing
+        # 2015 month only limits indicator depth. P0 costs ~100 requests and
+        # must not be left to whatever budget P1/P2 happen not to spend.
+        for month_start in _month_starts(today_d, RECENT_MONTHS_ALWAYS_REFRESHED):
+            for code in TW50_CONSTITUENTS:
+                backfill_stock_day_month(store, ns, code, month_start,
+                                         budget, sleep=sleep, force=True)
+
         # --- P1: valuation history ---
         backfill_valuation(store, ns, TW50_CONSTITUENTS, trading_dates,
                            budget, sleep=sleep)
@@ -433,10 +456,15 @@ def incremental_run(store, ns, start: date, budget: Budget,
                 else date(cur.year, cur.month + 1, 1)
         backfill_taifex(store, ns, taifex_months, sleep=sleep, budget=budget)
 
-        # --- P3: pre-warm per-stock STOCK_DAY (recent 6 months) ---
-        recent_months = _month_starts(today_d, 6)
-        for code in TW50_CONSTITUENTS:
-            for month_start in recent_months:
+        # --- P3: deepen per-stock STOCK_DAY history ---
+        # 6 months left ~126 bars, which cannot support MA240 and gives only 27
+        # weekly bars where the weekly MACD's 26-period EMA needs far more to
+        # converge — the screener was asserting a medium-term trend it had no
+        # data for. Month-major, newest first, so an interrupted run leaves
+        # every constituent at a similar depth rather than a few complete and
+        # the rest unusable.
+        for month_start in reversed(_month_starts(today_d, STOCK_DAY_TARGET_MONTHS)):
+            for code in TW50_CONSTITUENTS:
                 backfill_stock_day_month(store, ns, code, month_start,
                                          budget, sleep=sleep)
     except BudgetExhausted:

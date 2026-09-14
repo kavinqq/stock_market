@@ -437,8 +437,11 @@ class TestIncrementalRun(unittest.TestCase):
             })
 
     def test_valuation_dates_ingested_after_run(self):
+        # Budget must clear P0 first. Refreshing the months still being written
+        # now outranks history: 50 constituents x 2 months = 100 requests spent
+        # before valuation gets any. Production runs at 400, so ~300 remain.
         ns = FakeIncrementalNS(codes=["2330"])
-        budget = backfill.Budget(max_requests=50)
+        budget = backfill.Budget(max_requests=200)
         backfill.incremental_run(self.store, ns, start=date(2026, 1, 1),
                                  budget=budget, sleep=0)
         ingested = [d for d in ["2026-01-02", "2026-01-05", "2026-01-06",
@@ -494,3 +497,65 @@ class TestBackfillTwBudget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStockDayCurrentMonthRefresh(unittest.TestCase):
+    """The resume marker must not freeze the month that is still being written.
+
+    backfill_stock_day_month returned early on is_ingested for every month,
+    including the current one. September's marker was written on the 1st, so
+    every TW50 constituent's bars stopped there and the screener published
+    nine-session-old prices for the rest of the month.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = HistoryStore(os.path.join(self.tmp, "h.db"))
+        self.store.init_schema()
+
+    def _ns(self, bars):
+        ns = FakeIncrementalNS(codes=["2330"])
+        ns.fetch_stock_day = lambda s, m: bars
+        return ns
+
+    def test_force_refetches_an_already_ingested_month(self):
+        first = [MarketBar(date="2026-09-01", close=800.0, open=790.0,
+                           high=805.0, low=788.0, volume=1e7)]
+        ns = self._ns(first)
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 9, 1),
+                                          budget, sleep=0)
+        self.assertEqual(len(self.store.get_stock_daily("2330")), 1)
+
+        later = first + [MarketBar(date="2026-09-11", close=850.0, open=840.0,
+                                   high=860.0, low=838.0, volume=1.2e7)]
+        ns2 = self._ns(later)
+        backfill.backfill_stock_day_month(self.store, ns2, "2330", date(2026, 9, 1),
+                                          budget, sleep=0, force=True)
+        rows = self.store.get_stock_daily("2330")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["date"], "2026-09-11")
+
+    def test_without_force_the_stale_month_is_still_skipped(self):
+        ns = self._ns([MarketBar(date="2026-09-01", close=800.0, open=790.0,
+                                 high=805.0, low=788.0, volume=1e7)])
+        budget = backfill.Budget(max_requests=10)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 9, 1),
+                                          budget, sleep=0)
+        calls = len(ns.stock_day_calls)
+        backfill.backfill_stock_day_month(self.store, ns, "2330", date(2026, 9, 1),
+                                          budget, sleep=0)
+        self.assertEqual(len(ns.stock_day_calls), calls)
+
+    def test_incremental_run_refreshes_recent_months_before_anything_else(self):
+        """Today's prices outrank 2015 history: a stale bar breaks today's
+        report, a missing old month only limits indicator depth."""
+        ns = FakeIncrementalNS(codes=["2330"])
+        ns.fetch_stock_day = lambda s, m: [
+            MarketBar(date="2026-09-11", close=850.0, open=840.0,
+                      high=860.0, low=838.0, volume=1e7)]
+        budget = backfill.Budget(max_requests=4)   # only enough for the P0 sweep
+        backfill.incremental_run(self.store, ns, date(2026, 1, 1), budget, sleep=0)
+        rows = self.store.get_stock_daily("2330")
+        self.assertTrue(rows, "P0 must run before the budget is spent elsewhere")
+        self.assertEqual(rows[-1]["date"], "2026-09-11")

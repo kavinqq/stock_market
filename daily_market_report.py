@@ -150,23 +150,59 @@ def vix_reading(vix_indicators: Optional[IndicatorSet]) -> str:
     return f"VIX {close:.2f}，{level}，日變動 {fmt_pct(vix_indicators.day_change_pct)}"
 
 
+def fetch_optional(label: str, fn, *args, gaps: Optional[list] = None, **kwargs):
+    """Call an auxiliary data source; on failure record it and return None.
+
+    Only the price bars are load-bearing — without them there is no report. Every
+    other TWSE endpoint enriches it. Letting one of them abort the run is how a
+    transient 428 on BFI82U produced no report at all, twice, for a job whose
+    entire purpose is to produce one each evening.
+
+    Failures are collected rather than swallowed: a section that is quietly
+    absent reads as "nothing to report", so the report prints what could not be
+    fetched and why.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — degrade, never abort
+        message = f"{type(exc).__name__}: {exc}"
+        print(f"[data] {label} unavailable — {message}", file=sys.stderr)
+        if gaps is not None:
+            gaps.append({"source": label, "error": message[:300]})
+        return None
+
+
+def markdown_data_gaps(gaps: Optional[list]) -> list[str]:
+    """Name the sources that failed, so a gap is never read as a finding."""
+    if not gaps:
+        return []
+    lines = ["", "### 本次未取得的資料", ""]
+    for g in gaps:
+        lines.append(f"- **{g.get('source')}** 抓取失敗：{g.get('error')}")
+    lines.append("")
+    lines.append("> 相關欄位以 N/A 呈現；這是資料缺漏，不是「數值為零」或「無此現象」。")
+    lines.append("")
+    return lines
+
+
 def build_taiwan_report(end: date, lookback_months: int) -> dict[str, Any]:
     bars = fetch_twse_market_history(end, lookback_months)
     if not bars:
         raise RuntimeError("no TWSE market data")
     latest_date = bars[-1].date
     indicators = compute_indicators(bars, volume_attr="turnover")
-    margin = fetch_twse_margin(latest_date)
-    institutional = fetch_twse_institutional(latest_date)
-    summary = fetch_twse_summary(latest_date)
-    sectors = fetch_twse_sector_indices(latest_date)
-    try:
-        taifex = (fetch_taifex_inst_futures(latest_date) or {}).get(latest_date)
-    except Exception as exc:  # 期貨為輔助訊號,抓取失敗不應中斷整份報告
-        print(f"[taiwan] TAIFEX fetch error on {latest_date}: {exc}", file=sys.stderr)
-        taifex = None
+    gaps: list[dict] = []
+    margin = fetch_optional("融資餘額", fetch_twse_margin, latest_date, gaps=gaps)
+    institutional = fetch_optional("三大法人買賣金額", fetch_twse_institutional,
+                                   latest_date, gaps=gaps)
+    summary = fetch_optional("大盤成交統計", fetch_twse_summary, latest_date, gaps=gaps)
+    sectors = fetch_optional("類股指數", fetch_twse_sector_indices, latest_date, gaps=gaps)
+    taifex_all = fetch_optional("台指期法人未平倉", fetch_taifex_inst_futures,
+                                latest_date, gaps=gaps)
+    taifex = (taifex_all or {}).get(latest_date)
     return {
         "latest_date": latest_date,
+        "data_gaps": gaps,
         "bars": [asdict(bar) for bar in bars],
         "indicators": asdict(indicators),
         "margin": margin,
@@ -198,13 +234,15 @@ def build_us_report(end: date, lookback_days: int) -> dict[str, Any]:
             "indicators": asdict(compute_indicators(bars, volume_attr="volume")),
         }
 
-    vix_bars = fetch_vix_history(start, end)
+    gaps: list[dict] = []
+    vix_bars = fetch_optional("VIX 歷史", fetch_vix_history, start, end, gaps=gaps)
     vix_indicators = compute_indicators(vix_bars) if vix_bars else None
-    finra = fetch_finra_margin_statistics()
+    finra = fetch_optional("FINRA 融資統計", fetch_finra_margin_statistics, gaps=gaps)
     spy_indicators = IndicatorSet(**series["SPY"]["indicators"])
 
     return {
         "latest_date": series["SPY"]["bars"][-1]["date"],
+        "data_gaps": gaps,
         "series": series,
         "vix": {
             "bars": [asdict(bar) for bar in vix_bars],
@@ -1459,10 +1497,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- 台股：{tw_ind.trend_label}，{tw['volume_price_label']}，{tw['leverage_label']}。",
         f"- 隔夜美股脈絡：SPY {spy.trend_label}，QQQ {qqq.trend_label}，{us['vix']['label']}。",
         f"- 回推：{infer_cross_market(tw, us)[0]}",
+    ]
+    # Right under the summary, not buried: a reader must see what is missing
+    # before reading anything that depends on it.
+    lines.extend(markdown_data_gaps(
+        (tw.get("data_gaps") or []) + (us.get("data_gaps") or [])))
+    lines.extend([
         "",
         "## 台股大盤",
         "",
-    ]
+    ])
     lines.extend(f"- {line}" for line in summarize_twse(tw))
 
     sectors = (tw.get("sectors") or {}).get("rows") or {}

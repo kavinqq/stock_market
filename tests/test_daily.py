@@ -1,4 +1,6 @@
 import json, os, tempfile, unittest
+
+import daily_market_report as daily
 from daily_market_report import model_prediction
 from marketlib.features import FEATURE_NAMES_TW
 
@@ -548,3 +550,50 @@ class TestStock2330TechnicalBlock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-source resilience (added 2026-09-14)
+# ---------------------------------------------------------------------------
+
+def test_optional_fetch_records_the_failure_and_returns_none():
+    """One flaky endpoint must cost that one field, not the whole report.
+
+    A TWSE 428 on BFI82U (三大法人) aborted the entire daily run twice, so no
+    report was produced at all — the worst outcome for a job whose only job is
+    to produce one.
+    """
+    gaps = []
+
+    def boom():
+        raise RuntimeError("HTTP 428")
+
+    got = daily.fetch_optional("三大法人", boom, gaps=gaps)
+    assert got is None
+    assert len(gaps) == 1
+    assert gaps[0]["source"] == "三大法人"
+    assert "428" in gaps[0]["error"]
+
+
+def test_optional_fetch_passes_the_value_through_untouched():
+    gaps = []
+    assert daily.fetch_optional("x", lambda: {"a": 1}, gaps=gaps) == {"a": 1}
+    assert gaps == []
+
+
+def test_optional_fetch_forwards_arguments():
+    gaps = []
+    assert daily.fetch_optional("x", lambda a, b=0: a + b, 1, gaps=gaps, b=2) == 3
+
+
+def test_data_gaps_are_rendered_so_a_missing_field_is_visible():
+    """A silently absent section reads like 'nothing to report'. It has to say
+    the source failed, or the reader trusts a gap as a fact."""
+    lines = daily.markdown_data_gaps([
+        {"source": "三大法人", "error": "HTTP 428"},
+        {"source": "融資餘額", "error": "timeout"},
+    ])
+    body = "\n".join(lines)
+    assert "三大法人" in body and "融資餘額" in body
+    assert "428" in body
+    assert daily.markdown_data_gaps([]) == []

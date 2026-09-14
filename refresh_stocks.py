@@ -52,10 +52,16 @@ def refresh(db: str, months: int, max_requests: int, sleep: float,
                 ("stock_day", f"stock_day:{c}:{m.strftime('%Y-%m')}"))
     store.conn.commit()
 
-    spent = blocked = 0
+    # Month-major, newest first — NOT stock-major. Walking one stock through all
+    # 24 months before touching the next means an interrupted run leaves a few
+    # perfect stocks and the rest unusable. Sweeping the newest month across
+    # every stock first makes all of them current within ~100 requests, and each
+    # further pass adds depth uniformly, so stopping anywhere leaves a coherent
+    # dataset rather than a ragged one.
+    spent = blocked = consecutive_fail = 0
     t0 = time.time()
-    for code in codes:
-        for m in month_list:
+    for m in reversed(month_list):
+        for code in codes:
             if spent >= max_requests:
                 print(f"\n預算用盡（{max_requests} 次請求）。再執行一次即可從此處續傳。")
                 store.close()
@@ -67,10 +73,23 @@ def refresh(db: str, months: int, max_requests: int, sleep: float,
                 bars = ns.fetch_stock_day(code, m)
                 spent += 1
                 if not bars:
-                    # An empty month is a real answer for a stock not yet listed;
-                    # mark it so the next run does not ask again.
-                    store.mark_ingested("stock_day", key)
+                    # Empty is only a real answer for a month before this stock
+                    # was listed. For any later month it means TWSE returned
+                    # nothing this time — and marking that as done would skip it
+                    # permanently. Sixteen stocks silently stayed on 09-01 bars
+                    # that way, which is the exact failure this script exists to
+                    # prevent.
+                    known = store.get_stock_daily(code)
+                    pre_listing = bool(known) and m.strftime("%Y-%m") < known[0]["date"][:7]
+                    if pre_listing or not known:
+                        store.mark_ingested("stock_day", key)
+                    else:
+                        blocked += 1
+                        consecutive_fail += 1
+                        print(f"  ?? {code} {m:%Y-%m}: 回傳空值，不標記完成（下輪重試）",
+                              flush=True)
                     continue
+                consecutive_fail = 0
                 for bar in bars:
                     asof = F.twse_asof(bar.date, "price")
                     store.upsert_stock_daily({
@@ -83,8 +102,14 @@ def refresh(db: str, months: int, max_requests: int, sleep: float,
             except Exception as exc:  # noqa: BLE001
                 spent += 1
                 blocked += 1
+                consecutive_fail += 1
                 print(f"  !! {code} {m:%Y-%m}: {type(exc).__name__}", flush=True)
-                if blocked >= 5:
+                # CONSECUTIVE, not cumulative: scattered empty months across a
+                # 1200-request sweep are normal (a stock not yet listed, a quiet
+                # month), and counting them cumulatively stopped the run a few
+                # minutes in. A run of failures back-to-back is what actually
+                # signals a block.
+                if consecutive_fail >= 8:
                     print("\n連續失敗過多，TWSE 可能已限流。停止本輪，稍後再執行續傳。")
                     store.close()
                     return _summary(db, codes, spent, blocked, t0)

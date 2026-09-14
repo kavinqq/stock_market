@@ -2,7 +2,7 @@
   "artifact": "production_refit",
   "market": "tw",
   "model_type": "two_stage_logistic",
-  "trained_at": "2026-09-14T10:51:22",
+  "trained_at": "2026-09-14T11:07:34",
   "train_period": [
     "2015-01-05",
     "2026-09-09"
@@ -353,24 +353,24 @@
   "confidence_tiers": [
     {
       "label": "高",
-      "min_prob": 0.49473684210526314,
-      "oos_hit_rate": 0.5385996409335727,
-      "oos_sample_size": 557,
-      "oos_baseline_hit_rate": 0.5350089766606823
+      "min_prob": 0.5884615384615386,
+      "oos_hit_rate": 0.5802469135802469,
+      "oos_sample_size": 162,
+      "oos_baseline_hit_rate": 0.5370370370370371
     },
     {
       "label": "中",
-      "min_prob": 0.47875816993464054,
-      "oos_hit_rate": 0.47974068071312803,
-      "oos_sample_size": 617,
-      "oos_baseline_hit_rate": 0.47487844408427876
+      "min_prob": 0.5185950413223142,
+      "oos_hit_rate": 0.47564469914040114,
+      "oos_sample_size": 349,
+      "oos_baseline_hit_rate": 0.45558739255014324
     },
     {
       "label": "低",
       "min_prob": 0.0,
-      "oos_hit_rate": 0.35989717223650386,
-      "oos_sample_size": 778,
-      "oos_baseline_hit_rate": 0.36118251928020567
+      "oos_hit_rate": 0.3702213279678068,
+      "oos_sample_size": 497,
+      "oos_baseline_hit_rate": 0.3822937625754527
     }
   ],
   "oos_reference": {
@@ -380,6 +380,20 @@
     "tested_on": [
       "2025-01-15",
       "2026-09-09"
-    ]
+    ],
+    "rolling": {
+      "hit_rate": 0.44047619047619047,
+      "pooled_sample_size": 1008,
+      "windows_won": 3,
+      "windows_total": 8,
+      "baselines": {
+        "always_neutral": 0.43253968253968256,
+        "always_bull": 0.3253968253968254,
+        "always_bear": 0.24206349206349206
+      },
+      "brier": 0.6417901938951016,
+      "brier_constant_prior": 0.6484315948601663
+    },
+    "edge_demonstrated": false
   }
 }

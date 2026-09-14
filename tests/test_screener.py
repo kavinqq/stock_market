@@ -301,3 +301,24 @@ def test_large_gap_above_the_monthly_line_is_flagged():
 
 def test_a_clean_setup_carries_no_warnings():
     assert screener.technical_intersection(_bull_metrics())["warnings"] == []
+
+
+def test_missing_rsi_cannot_pass_the_overheat_veto():
+    """The veto asks "is RSI below 80?". With no RSI that question is
+    unanswered, and unanswered must not read as "yes" — otherwise the one
+    condition guarding against buying an already-extended stock is skipped
+    precisely when the data is thin."""
+    r = screener.technical_intersection(_bull_metrics(rsi=None))
+    assert r["is_candidate"] is False
+    assert r["insufficient_data"] is True
+    assert any("RSI" in v for v in r["vetoes"])
+
+
+def test_condition_labels_describe_what_is_actually_tested():
+    """`K >= D` is a bullish alignment that can persist for weeks; calling it
+    金叉 (a crossover event) overstates it. MACD is the same: a positive
+    histogram is a state, not today's turn."""
+    texts = " ".join(screener.core_condition_texts())
+    assert "金叉" not in texts
+    assert "K ≥ D" in texts
+    assert "翻多" not in texts

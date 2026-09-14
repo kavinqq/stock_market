@@ -606,6 +606,8 @@ def model_prediction(market: str, model_path: str, rows: list, us_rows: list) ->
             "confidence_calibrated": True,
             "tier_evidence": ml_model.tier_evidence(model, probs),
             "oos_reference": model.get("oos_reference"),
+            "edge_demonstrated": (model.get("oos_reference") or {}).get(
+                "edge_demonstrated"),
             "model_version": model.get("trained_at", "unknown"),
         }
     p = ml_model.predict_proba(model, feats)
@@ -1308,6 +1310,62 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
     return lines
 
 
+def markdown_model_credibility(pred: dict[str, Any]) -> list[str]:
+    """What today's call is actually worth, printed next to the call itself.
+
+    A direction and a confidence word are cheap to produce and easy to over-read.
+    These lines carry the measured track record for this confidence tier and,
+    when the model's edge over a constant guess does not survive its own error
+    bars, say so — in the report, not only in a commit message.
+    """
+    probs = pred.get("class_probabilities")
+    if not probs:
+        return []
+    lines = ["", "### 這個預測值多少（可信度）", ""]
+    lines.append(
+        "- 三類機率："
+        + "、".join(f"{k} {v:.1%}" for k, v in probs.items())
+        + "（已校準，總和為 1）"
+    )
+
+    tier = pred.get("tier_evidence") or {}
+    if tier.get("oos_hit_rate") is not None:
+        base = tier.get("oos_baseline_hit_rate")
+        line = (
+            f"- 本檔信心「{tier.get('label')}」的實測命中率："
+            f"{tier['oos_hit_rate']:.1%}（滾動樣本 {tier.get('oos_sample_size')} 天）"
+        )
+        if base is not None:
+            delta = tier["oos_hit_rate"] - base
+            line += (f"，同期間「永遠猜震盪」為 {base:.1%}，"
+                     f"差 {delta:+.1%}")
+            if delta <= 0:
+                line += "。**此信心層的方向判斷不優於常數猜測，建議忽略方向、只參考機率分布**"
+        lines.append(line)
+
+    ref = pred.get("oos_reference") or {}
+    roll = ref.get("rolling") or {}
+    if roll.get("hit_rate") is not None:
+        best = max([v for v in (roll.get("baselines") or {}).values()
+                    if v is not None], default=None)
+        line = (f"- 整體滾動驗證：{roll['hit_rate']:.1%}"
+                f"（{roll.get('pooled_sample_size')} 天，"
+                f"贏 {roll.get('windows_won')}/{roll.get('windows_total')} 個窗口）")
+        if best is not None:
+            line += f"，最強常數基準 {best:.1%}"
+        lines.append(line)
+
+    if pred.get("edge_demonstrated") is False:
+        lines.append(
+            "- ⚠️ **整體而言，本模型相對「永遠猜震盪」的優勢未通過信賴區間檢定**"
+            "（差異的 95% 區間跨越 0）。它的價值在於已校準的機率與高信心日的篩選，"
+            "不在於每日方向本身。"
+        )
+    elif pred.get("edge_demonstrated") is True:
+        lines.append("- 模型相對最強常數基準的優勢通過信賴區間檢定。")
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     generated = report["generated_at"]
     tw = report["taiwan"]
@@ -1368,6 +1426,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             ),
             "- 台股理由：" + "；".join(tw_pred.get("reasons", [])[:4]),
             "- 預測限制：" + "；".join(tw_pred.get("missing_data", [])[:5]),
+        ]
+    )
+    lines.extend(markdown_model_credibility(tw_pred))
+    lines.extend(
+        [
             "",
             "## 準確率追蹤",
             "",
@@ -2720,7 +2783,8 @@ def main() -> int:
             # Carry the two-stage extras through so the reader sees the full
             # distribution and the measured track record behind today's tier,
             # not just a single word.
-            for key in ("class_probabilities", "tier_evidence", "oos_reference"):
+            for key in ("class_probabilities", "tier_evidence", "oos_reference",
+                        "edge_demonstrated"):
                 if mp.get(key) is not None:
                     report["predictions"][market_key][key] = mp[key]
             if not mp.get("confidence_calibrated", True):

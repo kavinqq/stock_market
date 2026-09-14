@@ -84,10 +84,15 @@ def summarize(per_window, pooled, train_prior=None):
     model = [r["pred"] == r["actual"] for r in pooled]
     neutral = [r["actual"] == "震盪" for r in pooled]
     bull = [r["actual"] == "偏多" for r in pooled]
+    bear = [r["actual"] == "偏空" for r in pooled]
     cls = summarize_classification([{"prediction": r["pred"],
                                      "actual_direction": r["actual"]} for r in pooled])
     P = np.array([[r["probs"][lbl] for lbl in L] for r in pooled])
     truth = np.array([L.index(r["actual"]) for r in pooled])
+    # With no train_prior supplied this falls back to the evaluation period's own
+    # class frequencies — an oracle constant that saw the future. That is a
+    # STRICTER bar than a deployable constant, never a easier one, and the flag
+    # below records which of the two was used.
     prior = (np.array(train_prior) if train_prior is not None
              else np.array([(truth == k).mean() for k in range(3)]))
     out = {
@@ -100,8 +105,13 @@ def summarize(per_window, pooled, train_prior=None):
         "macro_f1": cls["macro_f1"],
         "brier": T._multiclass_brier(P, truth),
         "brier_constant_prior": T._multiclass_brier(np.tile(prior, (len(truth), 1)), truth),
+        "brier_constant_prior_is_oracle": train_prior is None,
+        # All three constants: the gate takes the max, so omitting always_bear
+        # would let a model through in a bearish period by measuring it against
+        # a weaker competitor than the one available.
         "baselines": {"always_neutral": float(np.mean(neutral)),
-                      "always_bull": float(np.mean(bull))},
+                      "always_bull": float(np.mean(bull)),
+                      "always_bear": float(np.mean(bear))},
         "significance": {
             "vs_always_neutral_mcnemar": mcnemar_test(model, neutral),
             "vs_always_neutral_bootstrap": block_bootstrap_diff(model, neutral, seed=0),

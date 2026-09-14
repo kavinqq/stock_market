@@ -239,18 +239,27 @@ def _core_conditions(m: dict) -> list[tuple[str, Optional[bool]]]:
          None if close is None or ma20 is None else close >= ma20),
         ("均線多頭排列（5日 ≥ 20日 ≥ 60日）",
          None if None in (ma5, ma20, ma60) else ma5 >= ma20 >= ma60),
-        ("日 MACD 翻多（柱狀轉正或黃金交叉）", _macd_bullish(m.get("macd_daily"))),
-        ("週 MACD 翻多（中期趨勢同向）", _macd_bullish(m.get("macd_weekly"))),
-        ("KD 金叉（K ≥ D）", None if k is None or d is None else k >= d),
+        ("日 MACD 位於多方（柱狀 > 0，或今日黃金交叉）", _macd_bullish(m.get("macd_daily"))),
+        ("週 MACD 位於多方（中期趨勢同向）", _macd_bullish(m.get("macd_weekly"))),
+        # Named for what it tests. This is a state that can hold for weeks, not
+        # a crossover event — calling it 金叉 would claim today's turn.
+        ("KD 多方排列（K ≥ D）", None if k is None or d is None else k >= d),
     ]
 
 
 def _veto_conditions(m: dict) -> list[tuple[str, bool]]:
+    """Disqualifiers. An unanswerable veto disqualifies too.
+
+    The veto asks "is RSI below 80?". With no RSI the answer is unknown, and
+    treating unknown as "yes" would skip the one guard against buying an
+    already-extended stock exactly when the data is thinnest.
+    """
     rsi_val = m.get("rsi")
-    out = []
-    if rsi_val is not None and rsi_val >= RSI_OVERHEATED:
-        out.append((f"RSI {rsi_val:.0f} ≥ {RSI_OVERHEATED:.0f}，短線過熱", True))
-    return out
+    if rsi_val is None or rsi_val != rsi_val:  # None or NaN
+        return [("RSI 無法計算，過熱與否無法判定", True)]
+    if rsi_val >= RSI_OVERHEATED:
+        return [(f"RSI {rsi_val:.0f} ≥ {RSI_OVERHEATED:.0f}，短線過熱", True)]
+    return []
 
 
 def _bonus_conditions(m: dict) -> list[tuple[str, Optional[bool]]]:
@@ -353,6 +362,7 @@ def technical_intersection(metrics: dict) -> dict:
     bonus_unknown = [text for text, ok in bonus if ok is None]
 
     veto_texts = [text for text, hit in vetoes if hit]
+    unanswerable_veto = any("無法" in t for t in veto_texts)
     is_candidate = not core_failed and not veto_texts
 
     total = len(core) + len(bonus)
@@ -368,7 +378,7 @@ def technical_intersection(metrics: dict) -> dict:
         "bonus_total": len(bonus),
         "bonus_failed": bonus_failed + [f"{t}（資料不足）" for t in bonus_unknown],
         "vetoes": veto_texts,
-        "insufficient_data": bool(unknown),
+        "insufficient_data": bool(unknown) or unanswerable_veto,
         "score": met / total if total else 0.0,
         "metrics_snapshot": _metrics_snapshot(metrics),
         "warnings": _warnings(metrics),

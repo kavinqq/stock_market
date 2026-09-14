@@ -507,6 +507,11 @@ def _confidence_tiers(top_probs, correct, baseline_correct=None,
     return tiers
 
 
+def _edge_demonstrated(metrics):
+    from marketlib.model import edge_demonstrated
+    return edge_demonstrated(metrics)
+
+
 def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
                     rolling_windows=8):
     os.makedirs(out_dir, exist_ok=True)
@@ -518,24 +523,14 @@ def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
     dir_art, dir_med, dir_oos = _build_stage(trainval, feature_names, "direction")
     med = {n: _nanmedian0([_get(s, n) for s in trainval]) for n in feature_names}
 
-    # --- confidence tiers from pooled walk-forward OOS (never in-sample) ---
-    # Building these from the trainval-fitted model's own trainval predictions
-    # would be in-sample and produced a non-monotonic table (高 scoring below 中).
-    # Align the two stages on the row indices they actually share.
-    mag_by_idx = dict(zip(mag_oos["idx"], mag_oos["z"]))
-    dir_by_idx = dict(zip(dir_oos["idx"], dir_oos["z"]))
-    shared = sorted(set(mag_by_idx) & set(dir_by_idx))
+    # --- confidence tiers (filled below from rolling validation) ---
+    # Deliberately NOT built from this stage's own pooled inner OOS: the base
+    # logits there are out-of-sample, but the isotonic calibration and the
+    # shrinkage λ are FIT on those very rows and then scored on them again, so
+    # the resulting hit rates are optimistically biased. Rolling validation
+    # refits every stage — calibration and shrinkage included — inside each
+    # window's own training set, so its predictions are out-of-sample end to end.
     tiers = []
-    if shared:
-        P_oos = _three_class_probs(
-            mag_art, dir_art,
-            np.array([mag_by_idx[i] for i in shared]),
-            np.array([dir_by_idx[i] for i in shared]))
-        truth_oos = np.array([DIRECTION_LABELS.index(trainval[i]["actual_direction"])
-                              for i in shared])
-        tiers = _confidence_tiers(P_oos.max(axis=1),
-                                  (P_oos.argmax(axis=1) == truth_oos),
-                                  baseline_correct=(truth_oos == 1))
 
     # --- honest evaluation on the held-out test window ---
     Xte = np.array([[_imp(_get(s, n), med[n]) for n in feature_names] for s in test])
@@ -600,7 +595,15 @@ def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
                 labeled, feature_names, windows=rolling_windows, window_days=126)
             if pooled:
                 metrics["rolling_validation"] = V.summarize(per_window, pooled)
-        except Exception as exc:  # noqa: BLE001 — never block a retrain on this
+                # Confidence tiers come from here, not from the inner pooled OOS:
+                # these predictions had their calibration and shrinkage fit
+                # strictly inside each window's training set.
+                top = np.array([r["top_prob"] for r in pooled])
+                correct = np.array([r["pred"] == r["actual"] for r in pooled])
+                neutral = np.array([r["actual"] == "震盪" for r in pooled])
+                tiers = _confidence_tiers(top, correct, baseline_correct=neutral)
+                metrics["confidence_tiers"] = tiers
+        except Exception as exc:  # noqa: BLE001 — recorded, and the gate fails closed
             metrics["rolling_validation_error"] = str(exc)
 
     metrics_path = os.path.join(out_dir, f"metrics_{market}.json")
@@ -627,8 +630,19 @@ def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
         "imputation_median": med_all,
         "stages": {"magnitude": mag_full, "direction": dir_full},
         "confidence_tiers": tiers,
-        "oos_reference": {"hit_rate": hit, "brier": brier, "brier_baseline": brier_base,
-                          "tested_on": metrics["tested_on"]},
+        # The honest headline travels WITH the model, so the daily report cannot
+        # state a confidence without also being able to state what it is worth.
+        "oos_reference": {
+            "hit_rate": hit, "brier": brier, "brier_baseline": brier_base,
+            "tested_on": metrics["tested_on"],
+            "rolling": {
+                k: (metrics.get("rolling_validation") or {}).get(k)
+                for k in ("hit_rate", "pooled_sample_size", "windows_won",
+                          "windows_total", "baselines", "brier",
+                          "brier_constant_prior")
+            } if metrics.get("rolling_validation") else None,
+            "edge_demonstrated": _edge_demonstrated(metrics),
+        },
     }
     model_path = os.path.join(out_dir, f"model_{market}.json")
     with open(model_path, "w") as fh:

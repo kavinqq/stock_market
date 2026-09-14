@@ -303,3 +303,74 @@ def test_gate_passes_when_rolling_validation_holds_up():
                                "baselines": {"always_neutral": 0.4325}}
     ok, reason = ml_model.passes_deploy_gate(m)
     assert ok is True, reason
+
+
+# ---------------------------------------------------------------------------
+# Review findings, 2026-09-14 (CodeX)
+# ---------------------------------------------------------------------------
+
+def test_nan_feature_is_imputed_not_turned_into_maximum_confidence():
+    """A NaN feature must take the imputation median, exactly as in training.
+
+    Before the fix `_stage_z` only replaced None, so a NaN produced z=NaN, every
+    comparison in the isotonic lookup was False, and the function fell through to
+    its last breakpoint — the HIGHEST calibrated probability. Missing data came
+    out the far end as maximum confidence.
+    """
+    m = _two_stage_model()
+    m["imputation_median"] = {"x": 0.0}
+    got = ml_model.predict_three_class(m, {"x": float("nan")})
+    assert got == ml_model.predict_three_class(m, {"x": 0.0})
+    assert got["震盪"] == pytest.approx(0.5)
+
+
+def test_isotonic_never_returns_the_top_breakpoint_for_a_nan_score():
+    cal = {"method": "isotonic", "x": [-2.0, 0.0, 2.0], "y": [0.2, 0.5, 0.8]}
+    assert ml_model._apply_isotonic(cal, float("nan")) != 0.8
+
+
+def test_gate_rejects_when_rolling_brier_has_no_skill():
+    """The fixed split's Brier is not enough — the rolling estimate has its own
+    Brier and its own constant baseline, and that pair governs too."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE,
+                      brier=0.2366, brier_base=0.2461)
+    m["rolling_validation"] = {
+        "hit_rate": 0.4405, "pooled_sample_size": 1008,
+        "baselines": {"always_neutral": 0.4325},
+        "brier": 0.6500, "brier_constant_prior": 0.6484,
+    }
+    ok, reason = ml_model.passes_deploy_gate(m)
+    assert ok is False
+    assert "Brier" in reason and "滾動" in reason
+
+
+def test_gate_fails_closed_when_rolling_validation_errored():
+    """A crashed validation must not silently fall back to the single split that
+    the whole exercise showed to be period luck."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE,
+                      brier=0.2366, brier_base=0.2461)
+    m["rolling_validation_error"] = "sqlite locked"
+    ok, reason = ml_model.passes_deploy_gate(m)
+    assert ok is False
+    assert "滾動驗證" in reason
+
+
+def test_gate_reports_whether_an_edge_was_actually_demonstrated():
+    """Passing the gate and having a proven edge are different claims. The
+    second must travel with the model so the report cannot overstate it."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE,
+                      brier=0.2366, brier_base=0.2461)
+    m["rolling_validation"] = {
+        "hit_rate": 0.4405, "pooled_sample_size": 1008,
+        "baselines": {"always_neutral": 0.4325},
+        "brier": 0.6418, "brier_constant_prior": 0.6484,
+        "significance": {"vs_always_neutral_bootstrap":
+                         {"ci_low": -0.0159, "ci_high": 0.0317}},
+    }
+    ok, reason = ml_model.passes_deploy_gate(m)
+    assert ok is True, reason
+    assert ml_model.edge_demonstrated(m) is False
+
+    m["rolling_validation"]["significance"]["vs_always_neutral_bootstrap"] = {
+        "ci_low": 0.012, "ci_high": 0.058}
+    assert ml_model.edge_demonstrated(m) is True

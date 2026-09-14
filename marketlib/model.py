@@ -61,7 +61,12 @@ def _stage_z(stage: dict, features: dict, feature_names: list, median: dict) -> 
     z = float(stage.get("intercept", 0.0))
     for name in feature_names:
         x = features.get(name)
-        if x is None:
+        # NaN must be imputed exactly as training's `_imp` does. Testing only for
+        # None let a NaN through, which made z NaN; every comparison in the
+        # isotonic lookup then evaluated False and the lookup fell through to its
+        # last breakpoint — the HIGHEST calibrated probability. Missing data came
+        # out as maximum confidence.
+        if x is None or (isinstance(x, float) and math.isnan(x)):
             x = median.get(name, 0.0)
         s = std.get(name, 1.0) or 1.0
         z += coef.get(name, 0.0) * ((x - mean.get(name, 0.0)) / s)
@@ -78,6 +83,10 @@ def _apply_isotonic(cal: dict, z: float) -> float:
     probability than anything we measured would be inventing confidence.
     """
     xs, ys = cal.get("x") or [], cal.get("y") or []
+    if math.isnan(z):
+        # Never let an unusable score silently pick a breakpoint. The midpoint of
+        # the table is the honest "no information" answer.
+        return float(ys[len(ys) // 2]) if ys else 0.5
     if not xs:
         return 1.0 / (1.0 + math.exp(-z))
     if z <= xs[0]:
@@ -181,6 +190,23 @@ def tier_evidence(model: dict, probs: dict) -> Optional[dict]:
     return None
 
 
+def edge_demonstrated(metrics: dict) -> bool:
+    """Whether the model's advantage over the best constant survives its own
+    error bars — a strictly stronger claim than passing the deploy gate.
+
+    A model can be worth deploying (calibrated probabilities, no worse than a
+    constant) while having no proven edge. TW is exactly that case: 0.4405 vs
+    0.4325 across eight rolling windows, bootstrap CI [-0.016, +0.032]. Keeping
+    the two claims separate is what stops the report from asserting skill the
+    data does not support.
+    """
+    rolling = metrics.get("rolling_validation") or {}
+    boot = ((rolling.get("significance") or {})
+            .get("vs_always_neutral_bootstrap") or {})
+    ci_low = boot.get("ci_low")
+    return ci_low is not None and ci_low > 0
+
+
 def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
     """Decide whether an OOS metrics artifact is fit to promote to production.
 
@@ -252,6 +278,11 @@ def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
     # rolling estimate is available it is the one that decides. TW showed 0.468
     # on the fixed split (p=0.008 vs always-震盪) but 0.441 across eight rolling
     # windows (p=0.57): the fixed split was period luck, not skill.
+    if metrics.get("rolling_validation_error"):
+        # Fail closed. Falling back to the single split when validation crashes
+        # would promote on exactly the evidence this gate exists to distrust.
+        return False, f"滾動驗證未完成：{metrics['rolling_validation_error']}"
+
     rolling = metrics.get("rolling_validation") or {}
     r_hit = rolling.get("hit_rate")
     r_base = (rolling.get("baselines") or {}).values()
@@ -261,6 +292,12 @@ def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
             f"滾動驗證命中率 {r_hit:.3f}（n={rolling.get('pooled_sample_size')}）"
             f"未達最強常數基準 {r_best:.3f}"
         )
+    r_brier = rolling.get("brier")
+    r_brier_base = rolling.get("brier_constant_prior")
+    if r_brier is not None and r_brier_base is not None and r_brier >= r_brier_base:
+        return False, (
+            f"滾動驗證機率無 skill：Brier {r_brier:.4f} 未優於常數 {r_brier_base:.4f}"
+        )
 
     if best_label is None:
         return True, f"通過：命中率 {hit_rate:.3f}，三類皆有預測（無基準可比）"
@@ -269,4 +306,6 @@ def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
         detail += f"，Brier {brier:.4f} < 常數 {brier_baseline:.4f}"
     if r_hit is not None:
         detail += f"，滾動驗證 {r_hit:.3f}（n={rolling.get('pooled_sample_size')}）"
+        detail += ("；優勢通過信賴區間檢定" if edge_demonstrated(metrics)
+                   else "；但優勢未通過信賴區間檢定（與最強常數無顯著差異）")
     return True, detail

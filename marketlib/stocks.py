@@ -6,7 +6,7 @@ returning None / [] on any failure — never raise to caller.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from statistics import mean
 from typing import Any, Optional
 
@@ -1611,6 +1611,7 @@ def river_valuation(
     pb_history: list[float],
     lookback: int = VALUATION_LOOKBACK_DAYS,
     min_history: int = MIN_VALUATION_BAND_HISTORY,
+    splits: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """The cheap-or-expensive verdict, on whichever multiple actually applies.
 
@@ -1622,6 +1623,28 @@ def river_valuation(
     Both bands are always returned, so the reader can see the two disagree when
     they do, and `caveats` carries the reasons this reading may mislead.
     """
+    # An unadjusted split makes the percentile meaningless rather than merely
+    # noisy: the whole stored history sits on the old share base, so today's
+    # restated multiple lands at the bottom of it by construction. 6669 read
+    # "cheapest in five years" on a PE that was a third of its true value.
+    split = (splits or [None])[-1] if splits else None
+    if split:
+        factor = split.get("factor") or 1.0
+        return {
+            "primary_metric": None, "band": None, "percentile": None,
+            "sample_size": None, "pe": pe, "pb": pb,
+            "pe_band": None, "pb_band": None,
+            "split_date": split.get("date"), "split_factor": factor,
+            "pe_split_adjusted": pe * factor if pe else None,
+            "pb_split_adjusted": pb * factor if pb else None,
+            "caveats": [
+                f"{split.get('date')} 發生約 {factor:.2g}:1 股票分割，"
+                f"交易所已調整股價但尚未調整每股盈餘/淨值，"
+                f"目前 PE、PB 被低估約 {factor:.2g} 倍；"
+                f"歷史分位全部建立在分割前基準，無法直接比較，故不給位階"
+            ],
+        }
+
     pe_band = valuation_band(pe, pe_history, lookback, min_history)
     pb_band = valuation_band(pb, pb_history, lookback, min_history)
 
@@ -1644,6 +1667,10 @@ def river_valuation(
 
     return {
         "primary_metric": metric,
+        "split_date": None,
+        "split_factor": None,
+        "pe_split_adjusted": None,
+        "pb_split_adjusted": None,
         "band": None if primary is None else primary["band"],
         "percentile": None if primary is None else primary["percentile"],
         "sample_size": None if primary is None else primary["sample_size"],
@@ -1653,3 +1680,122 @@ def river_valuation(
         "pb_band": pb_band,
         "caveats": caveats,
     }
+
+
+# ---------------------------------------------------------------------------
+# Unadjusted corporate actions
+# ---------------------------------------------------------------------------
+
+# TWSE caps a listed stock at ±10% per session, so a close-to-close move beyond
+# that cannot come from trading. It is a split, a capital reduction, a large
+# ex-dividend, or a data error — in every case the series is unadjusted and any
+# indicator spanning the gap is computed across two different share bases.
+# 11% leaves room for rounding on a limit move.
+PRICE_LIMIT_PCT = 0.11
+
+
+def detect_price_discontinuities(
+    bars: list[MarketBar],
+    limit: float = PRICE_LIMIT_PCT,
+    lookback: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Close-to-close moves that the daily price limit makes impossible.
+
+    Returns one entry per break: ``{"date", "prev_close", "close", "change_pct"}``.
+    ``lookback`` restricts the scan to the last N bars, which is how a caller
+    asks the question that actually matters — "does a break fall inside the
+    window my indicators use?". A split three years back is irrelevant to a
+    60-day average; one last week invalidates everything on screen.
+
+    This uses the market's own rule rather than a guessed threshold, so it needs
+    no corporate-action feed to know the series is broken.
+    """
+    window = bars[-(lookback + 1):] if lookback else bars
+    out: list[dict[str, Any]] = []
+    for prev, cur in zip(window, window[1:]):
+        if not prev.close or cur.close is None:
+            continue
+        change = cur.close / prev.close - 1
+        if abs(change) > limit:
+            out.append({"date": cur.date, "prev_close": prev.close,
+                        "close": cur.close, "change_pct": change})
+    return out
+
+
+# Longest trailing window any published indicator looks back over (MA240). A
+# corporate action inside this many bars still distorts something on screen.
+INDICATOR_SPAN_BARS = 240
+
+# Daily bars needed before the weekly MACD's 26-period EMA has converged:
+# MIN_WEEKLY_BARS (78) weeks at five sessions each.
+MIN_BARS_FOR_WEEKLY_TREND = 390
+
+
+# TWSE posts closing prices around 14:30 Taipei (see fetchers.twse_asof); 15:00
+# is a conservative point after which today's session can be expected.
+TWSE_PRICE_PUBLISH_HOUR = 15
+
+
+def last_completed_trading_day(today: date, now=None) -> date:
+    """The most recent session whose closing data TWSE has actually published.
+
+    Today only counts once its close is out — a report generated at noon must
+    ask for the previous session, or every stock fails a freshness check against
+    data that does not exist yet.
+
+    Weekends are skipped; holidays deliberately are not, since this carries no
+    holiday calendar. On a holiday it names a day with no data, the freshness
+    check asks for a refetch, and that refetch finds nothing new. One wasted
+    request is the right failure: the alternative it replaced — a 20-calendar-day
+    tolerance — let bars nine sessions old pass as current.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if now is None:
+        now = datetime.now(ZoneInfo("Asia/Taipei"))
+    d = today
+    if d == now.date() and now.hour < TWSE_PRICE_PUBLISH_HOUR:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:            # Sat/Sun
+        d -= timedelta(days=1)
+    return d
+
+
+# A split restates the price but, until the next quarterly filing, not trailing
+# EPS or book value — so TWSE's PE, PB and yield all move by the same factor on
+# the same day. That agreement is the signature: a genuine re-rating moves the
+# multiples independently. 20% is well clear of daily drift and well below the
+# smallest split worth worrying about.
+_SPLIT_MIN_FACTOR_DEVIATION = 0.20
+_SPLIT_RATIO_AGREEMENT = 0.05
+
+
+def detect_valuation_splits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Days where PE and PB jump by the same factor — an unadjusted split.
+
+    Returns ``{"date", "factor", "pe_ratio", "pb_ratio"}`` per break, where
+    ``factor`` is how far the multiples were divided (3.0 for a 3-for-1).
+
+    This matters beyond the price column: the multiples are what a river chart
+    reads, so an undetected split drops today's PE to a third of its true value
+    and the percentile lands at the very bottom of a history recorded entirely
+    on the old share base. The stock reads "cheapest in five years" precisely
+    because the number is wrong.
+    """
+    out: list[dict[str, Any]] = []
+    for prev, cur in zip(rows, rows[1:]):
+        pe0, pe1 = prev.get("pe"), cur.get("pe")
+        pb0, pb1 = prev.get("pb"), cur.get("pb")
+        if not all(isinstance(v, (int, float)) and v > 0 for v in (pe0, pe1, pb0, pb1)):
+            continue
+        pe_ratio, pb_ratio = pe0 / pe1, pb0 / pb1
+        if abs(pe_ratio - 1) < _SPLIT_MIN_FACTOR_DEVIATION:
+            continue
+        # Both multiples must move together, in the same direction, by the same
+        # factor — otherwise it is a re-rating, which is real information.
+        if abs(pe_ratio - pb_ratio) / max(pe_ratio, pb_ratio) > _SPLIT_RATIO_AGREEMENT:
+            continue
+        out.append({"date": cur["date"], "factor": (pe_ratio + pb_ratio) / 2,
+                    "pe_ratio": pe_ratio, "pb_ratio": pb_ratio})
+    return out

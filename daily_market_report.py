@@ -1286,7 +1286,12 @@ def markdown_intersection_block(screener: list[dict]) -> list[str]:
                   if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
         riv = r.get("river") or {}
         band = riv.get("band")
-        band_str = (f"{band}（{riv.get('primary_metric')}）" if band else "資料不足")
+        if band:
+            band_str = f"{band}（{riv.get('primary_metric')}）"
+        elif riv.get("split_factor"):
+            band_str = f"分割未還原（{riv['split_factor']:.2g}:1）"
+        else:
+            band_str = "資料不足"
         pct_str = (f"{riv['percentile']:.0%}" if riv.get("percentile") is not None else "—")
         lines.append(
             f"| **{ins.get('shortlist_rank','—')}** | {r.get('code','')} | {r.get('name','')} "
@@ -2459,6 +2464,8 @@ def assemble_screener(
             "ret60": tech.get("ret60"),
             "intersection": tech.get("intersection"),
             "river": tech.get("river"),
+            "bars_asof": tech.get("bars_asof"),
+            "bars_count": tech.get("bars_count"),
         })
     ranked = _screener.build_screener(records)
     # Re-attach name and the technical intersection to ranked rows (build_screener
@@ -2470,6 +2477,8 @@ def assemble_screener(
             row["name"] = src.get("name", row.get("code", ""))
         row["intersection"] = src.get("intersection")
         row["river"] = src.get("river")
+        row["bars_asof"] = src.get("bars_asof")
+        row["bars_count"] = src.get("bars_count")
     return ranked
 
 
@@ -2531,22 +2540,28 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
 
     # --- Per-code: history from store cache; fetch+upsert if stale/missing ---
     tech_by_code: dict[str, dict] = {}
-    # Freshness: bars must include the last 20 days before `end`
-    stale_threshold = (end - timedelta(days=20)).isoformat()
+    # Freshness is decided against the last COMPLETED trading day, not a
+    # 20-calendar-day tolerance. The old threshold (end - 20 days) accepted bars
+    # from 2026-09-01 on 2026-09-14 as current, so the screener published prices
+    # nine trading days stale and never refetched. Anything short of the latest
+    # session now triggers a fetch.
+    expected_asof = _stocks.last_completed_trading_day(end).isoformat()
 
     for code in codes:
         try:
             cached_rows = store.get_stock_daily(code)
-            # Decide if cache is fresh enough (last row within 20 days of end)
             need_fetch = (
                 not cached_rows
-                or cached_rows[-1]["date"] < stale_threshold
+                or cached_rows[-1]["date"] < expected_asof
+                or len(cached_rows) < _stocks.MIN_BARS_FOR_WEEKLY_TREND
             )
 
             daily_bars: list = []
             if need_fetch:
                 time.sleep(0.6)
-                fetched_bars = _stocks.fetch_stock_history(code, end, lookback_months=5)
+                # 5 months left ~126 bars: MA240 impossible and only 27 weekly bars,
+                # far short of what the weekly MACD needs to converge.
+                fetched_bars = _stocks.fetch_stock_history(code, end, lookback_months=24)
                 if fetched_bars:
                     for bar in fetched_bars:
                         store.upsert_stock_daily({
@@ -2594,7 +2609,16 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                     "tech_raw": tech_raw,
                     "ret20": tech_m.get("ret20"),
                     "ret60": tech_m.get("ret60"),
-                    "intersection": _screener.technical_intersection(tech_m),
+                    "intersection": _screener.technical_intersection(
+                        tech_m,
+                        weekly_bars=len(_stocks.resample_weekly(daily_bars)),
+                        discontinuities=_stocks.detect_price_discontinuities(
+                            daily_bars, lookback=_stocks.INDICATOR_SPAN_BARS),
+                        bars_asof=daily_bars[-1].date if daily_bars else None,
+                        expected_asof=expected_asof,
+                    ),
+                    "bars_asof": daily_bars[-1].date if daily_bars else None,
+                    "bars_count": len(daily_bars),
                 }
                 # Where today's multiple sits inside this stock's own recent
                 # range — the question a PE river chart answers by eye.
@@ -2607,6 +2631,8 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                         pb=val_now.get("pb"),
                         pe_history=[r.get("pe") for r in hist],
                         pb_history=[r.get("pb") for r in hist],
+                        splits=_stocks.detect_valuation_splits(
+                            hist[-_stocks.VALUATION_LOOKBACK_DAYS:]),
                     )
                     tech_by_code[code]["river"]["asof"] = val_now.get("valuation_asof")
                     tech_by_code[code]["river"]["is_stale"] = val_now.get(
@@ -2663,7 +2689,12 @@ def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
         missing = "；".join(ins["bonus_failed"])
         riv = r.get("river") or {}
         band = riv.get("band")
-        band_str = (f'{band}（{riv.get("primary_metric")}）' if band else "資料不足")
+        if band:
+            band_str = f'{band}（{riv.get("primary_metric")}）'
+        elif riv.get("split_factor"):
+            band_str = f'分割未還原（{riv["split_factor"]:.2g}:1）'
+        else:
+            band_str = "資料不足"
         pct_str = (f'{riv["percentile"]:.0%}' if riv.get("percentile") is not None else "—")
         body_rows += (
             f'<tr><td><strong>{ins.get("shortlist_rank","—")}</strong></td>'

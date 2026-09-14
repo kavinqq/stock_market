@@ -619,3 +619,133 @@ def test_no_usable_valuation_returns_an_explicit_unknown():
                                pe_history=[], pb_history=[])
     assert r["band"] is None
     assert r["primary_metric"] is None
+
+
+# ---------------------------------------------------------------------------
+# Unadjusted corporate actions (added 2026-09-14, after 6669 緯穎 split)
+# ---------------------------------------------------------------------------
+
+def _bars(closes, start_day=1):
+    from marketlib.core import MarketBar
+    return [MarketBar(date=f"2026-01-{start_day + i:02d}", close=c, high=c, low=c,
+                      open=c, volume=1000.0)
+            for i, c in enumerate(closes)]
+
+
+def test_no_discontinuity_flagged_for_ordinary_trading():
+    """TWSE caps a day at ±10%, so anything inside that is just a market move."""
+    assert stocks.detect_price_discontinuities(_bars([100, 109, 100, 105, 96])) == []
+
+
+def test_split_sized_gap_is_detected():
+    """A 5-for-1 split shows as a -80% close-to-close move, which no amount of
+    selling can produce under a 10% daily limit — so the series is unadjusted."""
+    found = stocks.detect_price_discontinuities(_bars([7800, 7700, 1540, 1560]))
+    assert len(found) == 1
+    assert found[0]["date"] == "2026-01-03"
+    assert found[0]["change_pct"] < -0.5
+
+
+def test_capital_reduction_sized_gap_is_detected_in_both_directions():
+    assert len(stocks.detect_price_discontinuities(_bars([100, 130]))) == 1
+    assert len(stocks.detect_price_discontinuities(_bars([130, 100]))) == 1
+
+
+def test_limit_move_itself_is_not_a_discontinuity():
+    """Exactly at the limit is legal trading and must not be flagged."""
+    assert stocks.detect_price_discontinuities(_bars([100, 110])) == []
+    assert stocks.detect_price_discontinuities(_bars([100, 90])) == []
+
+
+def test_only_recent_discontinuities_matter_for_current_indicators():
+    """A split three years ago no longer touches a 60-day moving average; one
+    last week poisons everything on screen."""
+    old = _bars([100.0] * 5 + [20.0] * 200, start_day=1)
+    assert stocks.detect_price_discontinuities(old, lookback=60) == []
+    assert len(stocks.detect_price_discontinuities(old)) == 1
+
+
+def test_last_completed_trading_day_waits_for_the_close_to_be_published():
+    """TWSE posts closing prices around 14:30. A report generated at noon must
+    ask for yesterday's session, or every stock fails the freshness check
+    against data that does not exist yet."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Taipei")
+    noon = datetime(2026, 9, 14, 12, 0, tzinfo=tz)      # Monday, pre-publish
+    evening = datetime(2026, 9, 14, 20, 0, tzinfo=tz)   # Monday, post-publish
+    assert stocks.last_completed_trading_day(date(2026, 9, 14), noon) == date(2026, 9, 11)
+    assert stocks.last_completed_trading_day(date(2026, 9, 14), evening) == date(2026, 9, 14)
+
+
+def test_last_completed_trading_day_skips_the_weekend():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Taipei")
+    sunday = datetime(2026, 9, 13, 20, 0, tzinfo=tz)
+    assert stocks.last_completed_trading_day(date(2026, 9, 13), sunday) == date(2026, 9, 11)
+
+
+def test_split_in_the_valuation_series_is_detected_by_matching_ratios():
+    """6669 on 2026-09-02: PE 25.01→8.37, PB 10.62→3.55, yield 2.11→6.29.
+
+    TWSE restated the price but not trailing EPS, so every multiple moved by the
+    same factor on the same day. That triple signature is a split, not a
+    re-rating — and it made the post-split PE understate value by 3x, which read
+    as "cheapest in five years".
+    """
+    rows = [
+        {"date": "2026-09-01", "pe": 25.01, "pb": 10.62, "dividend_yield": 2.11},
+        {"date": "2026-09-02", "pe": 8.37, "pb": 3.55, "dividend_yield": 6.29},
+        {"date": "2026-09-03", "pe": 7.93, "pb": 3.37, "dividend_yield": 6.64},
+    ]
+    found = stocks.detect_valuation_splits(rows)
+    assert len(found) == 1
+    assert found[0]["date"] == "2026-09-02"
+    assert found[0]["factor"] == pytest.approx(3.0, abs=0.05)
+
+
+def test_an_earnings_driven_re_rating_is_not_called_a_split():
+    """A quarterly EPS restatement moves PE alone; PB stays put. That is a real
+    valuation change and must survive."""
+    rows = [
+        {"date": "2026-05-14", "pe": 30.0, "pb": 4.0, "dividend_yield": 2.0},
+        {"date": "2026-05-15", "pe": 15.0, "pb": 4.02, "dividend_yield": 2.0},
+    ]
+    assert stocks.detect_valuation_splits(rows) == []
+
+
+def test_ordinary_daily_drift_is_not_a_split():
+    rows = [{"date": f"2026-09-{d:02d}", "pe": 20.0 + d * 0.1,
+             "pb": 3.0 + d * 0.01, "dividend_yield": 2.0} for d in range(1, 10)]
+    assert stocks.detect_valuation_splits(rows) == []
+
+
+def test_river_valuation_refuses_a_verdict_across_an_unadjusted_split():
+    """The five-year history is entirely pre-split, so a post-split multiple
+    lands at the bottom of it by construction. Reporting 極便宜 there is worse
+    than reporting nothing."""
+    hist = [float(x) for x in range(15, 31)] * 20   # PE has lived in 15..30
+    r = stocks.river_valuation("6669", min_history=100, pe=7.41, pb=3.14,
+                               pe_history=hist, pb_history=hist,
+                               splits=[{"date": "2026-09-02", "factor": 3.0}])
+    assert r["band"] is None
+    assert any("分割" in c for c in r["caveats"])
+    assert r["split_factor"] == pytest.approx(3.0)
+
+
+def test_river_valuation_reports_the_split_adjusted_multiple_for_context():
+    hist = [float(x) for x in range(15, 31)] * 20
+    r = stocks.river_valuation("6669", min_history=100, pe=7.41, pb=3.14,
+                               pe_history=hist, pb_history=hist,
+                               splits=[{"date": "2026-09-02", "factor": 3.0}])
+    assert r["pe_split_adjusted"] == pytest.approx(7.41 * 3.0)
+
+
+def test_river_valuation_is_unchanged_when_there_is_no_split():
+    hist = [float(x) for x in range(15, 31)] * 20
+    a = stocks.river_valuation("2357", min_history=100, pe=20.0, pb=20.0,
+                               pe_history=hist, pb_history=hist)
+    b = stocks.river_valuation("2357", min_history=100, pe=20.0, pb=20.0,
+                               pe_history=hist, pb_history=hist, splits=[])
+    assert a["band"] == b["band"] and a["band"] is not None

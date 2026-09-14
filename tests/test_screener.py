@@ -415,3 +415,54 @@ def test_fallback_does_not_overwrite_a_partial_live_row():
         _HIST, asof="2026-09-14")
     assert merged["2357"]["pe"] == 14.0
     assert merged["2357"]["valuation_is_stale"] is False
+
+
+# ---------------------------------------------------------------------------
+# Data-quality gates on the intersection (added 2026-09-14)
+# ---------------------------------------------------------------------------
+
+def test_weekly_macd_needs_a_converged_series_not_just_a_computable_one():
+    """macd() returns a number at 26 weekly bars, but a 26-period EMA seeded on
+    27 points has not converged — asserting 中期趨勢同向 from that is a claim the
+    data cannot support. The screener ran on 5 months of history and did exactly
+    that for every stock.
+    """
+    m = _bull_metrics()
+    thin = screener.technical_intersection(m, weekly_bars=27)
+    assert thin["is_candidate"] is False
+    assert thin["insufficient_data"] is True
+    assert any("週" in f and "資料" in f for f in thin["core_failed"])
+
+    deep = screener.technical_intersection(m, weekly_bars=104)
+    assert deep["is_candidate"] is True
+
+
+def test_an_unadjusted_corporate_action_disqualifies_the_stock():
+    """After a split the raw series mixes two share bases; every moving average
+    and oscillator crossing that date is arithmetic on incomparable numbers."""
+    r = screener.technical_intersection(
+        _bull_metrics(), weekly_bars=104,
+        discontinuities=[{"date": "2026-09-08", "change_pct": -0.8,
+                          "prev_close": 7800.0, "close": 1560.0}])
+    assert r["is_candidate"] is False
+    assert any("還原" in v or "分割" in v for v in r["vetoes"])
+    assert r["insufficient_data"] is True
+
+
+def test_stale_bars_disqualify_rather_than_quietly_pricing_last_week():
+    """A verdict printed today must be about today. The freshness check compared
+    against a 20-calendar-day threshold, so bars nine trading days old passed as
+    current and the table published last week's prices as if they were live."""
+    r = screener.technical_intersection(_bull_metrics(), weekly_bars=104,
+                                        bars_asof="2026-09-01",
+                                        expected_asof="2026-09-11")
+    assert r["is_candidate"] is False
+    assert any("2026-09-01" in v for v in r["vetoes"])
+    fresh = screener.technical_intersection(_bull_metrics(), weekly_bars=104,
+                                            bars_asof="2026-09-11",
+                                            expected_asof="2026-09-11")
+    assert fresh["is_candidate"] is True
+
+
+def test_data_quality_gates_are_opt_in_so_existing_callers_are_unaffected():
+    assert screener.technical_intersection(_bull_metrics())["is_candidate"] is True

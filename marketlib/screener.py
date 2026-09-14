@@ -214,6 +214,11 @@ def build_screener(
 
 RSI_OVERHEATED = 80.0
 VOLUME_EXPANSION = 1.0
+# A 26-period EMA needs roughly three periods' worth of history past its span
+# before it stops depending on how it was seeded. macd() will return a number at
+# 26 weekly bars, but that number mostly reflects the seed, so the weekly trend
+# condition requires a genuinely converged series.
+MIN_WEEKLY_BARS = 78
 KD_OVERBOUGHT = 80.0
 MA20_GAP_STRETCHED = 0.15
 
@@ -338,7 +343,33 @@ def _warnings(m: dict) -> list[str]:
     return out
 
 
-def technical_intersection(metrics: dict) -> dict:
+def _data_quality_vetoes(weekly_bars, discontinuities, bars_asof,
+                         expected_asof) -> list[tuple[str, bool, bool]]:
+    """Reasons the inputs cannot support a verdict, whatever the inputs say.
+
+    These are separated from the market conditions because they are statements
+    about the data, not about the stock. Each one is (text, disqualifies,
+    unanswerable) — all three unanswerable, since none of them means "bearish",
+    they mean "we do not know".
+    """
+    out: list[tuple[str, bool, bool]] = []
+    if bars_asof and expected_asof and bars_asof < expected_asof:
+        out.append((f"K 線資料僅到 {bars_asof}，最新交易日為 {expected_asof}，"
+                    f"報價與指標並非當前", True, True))
+    for d in discontinuities or []:
+        out.append((f"{d['date']} 出現 {d['change_pct']:+.0%} 跳空，"
+                    f"超過漲跌幅限制 → 未還原的分割/減資/除權息，"
+                    f"跨越該日的均線與指標不可比", True, True))
+    return out
+
+
+def technical_intersection(
+    metrics: dict,
+    weekly_bars: Optional[int] = None,
+    discontinuities: Optional[list[dict]] = None,
+    bars_asof: Optional[str] = None,
+    expected_asof: Optional[str] = None,
+) -> dict:
     """Evaluate one stock against the fixed technical intersection.
 
     `metrics` is the dict from ``marketlib.stocks.technical_metrics``.
@@ -352,7 +383,12 @@ def technical_intersection(metrics: dict) -> dict:
     report can show the reasoning rather than just a verdict.
     """
     core = _core_conditions(metrics)
-    vetoes = _veto_conditions(metrics)
+    if weekly_bars is not None and weekly_bars < MIN_WEEKLY_BARS:
+        # Replace the weekly verdict with an explicit unknown rather than let a
+        # barely-seeded EMA stand in for a medium-term trend.
+        core = [(t, (None if t.startswith("週 MACD") else v)) for t, v in core]
+    vetoes = _veto_conditions(metrics) + _data_quality_vetoes(
+        weekly_bars, discontinuities, bars_asof, expected_asof)
     bonus = _bonus_conditions(metrics)
 
     core_passed = [text for text, ok in core if ok is True]

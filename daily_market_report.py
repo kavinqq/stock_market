@@ -2550,18 +2550,22 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
     for code in codes:
         try:
             cached_rows = store.get_stock_daily(code)
+            # Freshness only. Depth is refresh_stocks.py's job: topping up to 24
+            # months here would be ~1200 throttled TWSE calls inside the daily
+            # run. A shallow stock is not fetched harder, it is disqualified
+            # with a stated reason further down.
             need_fetch = (
                 not cached_rows
                 or cached_rows[-1]["date"] < expected_asof
-                or len(cached_rows) < _stocks.MIN_BARS_FOR_WEEKLY_TREND
             )
 
             daily_bars: list = []
             if need_fetch:
                 time.sleep(0.6)
-                # 5 months left ~126 bars: MA240 impossible and only 27 weekly bars,
-                # far short of what the weekly MACD needs to converge.
-                fetched_bars = _stocks.fetch_stock_history(code, end, lookback_months=24)
+                # Two months is enough to bring the tail current; the deep
+                # history comes from refresh_stocks.py, and the store already
+                # holds whatever it has fetched. Merged with the cache below.
+                fetched_bars = _stocks.fetch_stock_history(code, end, lookback_months=2)
                 if fetched_bars:
                     for bar in fetched_bars:
                         store.upsert_stock_daily({
@@ -2573,7 +2577,16 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                             "open": bar.open,
                             "volume": bar.volume,
                         })
-                    daily_bars = fetched_bars
+                    # Merge, do not replace: the 2-month tail must not truncate
+                    # the deeper history refresh_stocks.py has accumulated.
+                    from marketlib.core import MarketBar as _MB
+                    merged = {r["date"]: _MB(date=r["date"], close=r["close"],
+                                             high=r.get("high"), low=r.get("low"),
+                                             open=r.get("open"), volume=r.get("volume"))
+                              for r in (cached_rows or []) if r.get("close") is not None}
+                    for b in fetched_bars:
+                        merged[b.date] = b
+                    daily_bars = [merged[k] for k in sorted(merged)]
                 else:
                     # Fall back to whatever is in the store
                     from marketlib.core import MarketBar

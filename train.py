@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os
 from datetime import datetime
 import numpy as np
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from marketlib.evaluation import summarize_classification, summarize_baselines
 from marketlib.stats import mcnemar_test, block_bootstrap_diff
@@ -275,7 +276,367 @@ def train_from_samples(samples, feature_names, market, out_dir, test_frac=None,
         json.dump(model, fh, ensure_ascii=False, indent=2)
     return model_path, metrics_path
 
-def train_market(db, market, out_dir, test_months=18, seed=0):
+# ---------------------------------------------------------------------------
+# Two-stage three-class model (2026-09-14)
+#
+# Why two stages instead of one binary P(up) sliced by thresholds:
+# the previous design trained on sign(next return) and manufactured 三分類 by
+# cutting that single probability at bull/bear. Measured on rolling OOS, the two
+# questions have genuinely different amounts of signal —
+#     magnitude ("is tomorrow a 震盪 day?")   AUC 0.607  95%CI [0.565, 0.646]
+#     direction ("up or down, given a big move") AUC 0.587  95%CI [0.531, 0.643]
+#     raw sign  (what the old model trained on) AUC 0.566  95%CI [0.523, 0.607]
+# — and a single P(up) cannot express magnitude at all: P(up)≈0.5 means both
+# "quiet day" and "big move, direction unknown". 震盪 is also the plurality
+# class (~44% of TW days), so collapsing it cost the most accuracy.
+# ---------------------------------------------------------------------------
+
+DIRECTION_LABELS = ["偏多", "震盪", "偏空"]
+STAGE_C_GRID = (0.003, 0.01, 0.03, 0.1, 0.3, 1.0)
+
+
+def _stage_labels(samples, stage):
+    """Per-stage target. `direction` is only defined on big-move days, so it
+    returns None there and those rows are dropped from that stage's fit."""
+    out = []
+    for s in samples:
+        d = s["actual_direction"]
+        if stage == "magnitude":
+            out.append(1 if d == "震盪" else 0)
+        else:
+            out.append(None if d == "震盪" else (1 if d == "偏多" else 0))
+    return out
+
+
+def _stage_matrix(samples, feature_names, stage, med=None):
+    y_all = _stage_labels(samples, stage)
+    keep = [i for i, y in enumerate(y_all) if y is not None]
+    if med is None:
+        med = {n: _nanmedian0([_get(samples[i], n) for i in keep]) for n in feature_names}
+    X = np.array([[_imp(_get(samples[i], n), med[n]) for n in feature_names] for i in keep],
+                 dtype=float)
+    y = np.array([y_all[i] for i in keep], dtype=int)
+    return X, y, med
+
+
+def _fit_stage_raw(X, y, C):
+    mean = X.mean(axis=0); std = X.std(axis=0); std[std == 0] = 1.0
+    clf = LogisticRegression(C=C, max_iter=2000, class_weight="balanced")
+    clf.fit((X - mean) / std, y)
+    return clf, mean, std
+
+
+def _stage_oos_scores(samples, feature_names, stage, C, n_folds=4, embargo=EMBARGO):
+    """Pooled walk-forward OOS decision scores for one stage.
+
+    Standardization and the fit come from each fold's TRAIN slice only, purged by
+    `embargo` rows next to the validation fold, so the pooled (z, y) used for
+    calibration and for the confidence tiers never saw its own outcome.
+
+    Scores are returned for EVERY validation row, including rows this stage has
+    no label for (the direction stage is undefined on 震盪 days). That matters
+    because at prediction time we must ask both stages about every day, so the
+    confidence tiers have to be built from both stages' scores on the same rows.
+    `y` is -1 where the stage has no label; callers filter before calibrating.
+    """
+    n = len(samples); fold = n // (n_folds + 1)
+    z_all, y_all, idx_all = [], [], []
+    for k in range(1, n_folds + 1):
+        tr = samples[: max(0, fold * k - embargo)]
+        va_lo, va_hi = fold * k, fold * (k + 1)
+        va = samples[va_lo:va_hi]
+        if len(va) < 10:
+            continue
+        Xtr, ytr, med = _stage_matrix(tr, feature_names, stage)
+        if len(set(ytr.tolist())) < 2 or len(Xtr) < 30:
+            continue
+        # Score every validation row, labelled or not.
+        Xva = np.array([[_imp(_get(s, n_), med[n_]) for n_ in feature_names] for s in va],
+                       dtype=float)
+        labels = _stage_labels(va, stage)
+        clf, mean, std = _fit_stage_raw(Xtr, ytr, C)
+        z_all.extend(clf.decision_function((Xva - mean) / std).tolist())
+        y_all.extend([-1 if y is None else y for y in labels])
+        idx_all.extend(range(va_lo, va_lo + len(va)))
+    return np.array(z_all, dtype=float), np.array(y_all, dtype=int), idx_all
+
+
+def _select_stage_C(samples, feature_names, stage):
+    """Pick C by pooled-OOS log loss — a proper scoring rule, so it rewards
+    calibrated probabilities rather than just correct ordering."""
+    best, best_ll = STAGE_C_GRID[0], float("inf")
+    for C in STAGE_C_GRID:
+        z, y, _ = _stage_oos_scores(samples, feature_names, stage, C)
+        lab = y >= 0
+        z, y = z[lab], y[lab]
+        if len(z) < 50 or len(set(y.tolist())) < 2:
+            continue
+        p = np.clip(1.0 / (1.0 + np.exp(-z)), 1e-6, 1 - 1e-6)
+        ll = float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+        if ll < best_ll:
+            best_ll, best = ll, C
+    return best, best_ll
+
+
+def _fit_isotonic(z, y):
+    """Isotonic map from decision score to observed frequency, fit on pooled OOS."""
+    iso = IsotonicRegression(y_min=0.02, y_max=0.98, out_of_bounds="clip")
+    iso.fit(z, y)
+    return {"method": "isotonic",
+            "x": [float(v) for v in iso.X_thresholds_],
+            "y": [float(v) for v in iso.y_thresholds_]}
+
+
+def _iso_apply(cal, z):
+    return np.interp(np.asarray(z, dtype=float), cal["x"], cal["y"])
+
+
+SHRINK_GRID = (0.0, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0)
+
+
+def _select_shrinkage(p_oos, y_oos, prior):
+    """Pick λ for `p = prior + λ(p_oos − prior)` by Brier on pooled OOS.
+
+    A stage can rank well yet be badly scaled. Brier is a proper scoring rule,
+    so it penalises exactly that overshoot; λ=1 wins whenever the raw
+    calibration is already honest, and λ=0 drops a stage that only adds noise.
+    """
+    best_lam, best_brier = 1.0, float("inf")
+    for lam in SHRINK_GRID:
+        p = prior + lam * (p_oos - prior)
+        b = float(np.mean((p - y_oos) ** 2))
+        if b < best_brier:
+            best_brier, best_lam = b, lam
+    return best_lam, best_brier
+
+
+def _build_stage(samples, feature_names, stage):
+    """Fit one stage end to end: choose C on pooled OOS, calibrate on pooled OOS,
+    then refit the point model on everything given to this call."""
+    C, ll = _select_stage_C(samples, feature_names, stage)
+    z_oos, y_oos, idx_oos = _stage_oos_scores(samples, feature_names, stage, C)
+    lab = y_oos >= 0
+    cal = (_fit_isotonic(z_oos[lab], y_oos[lab])
+           if len(set(y_oos[lab].tolist())) >= 2 else {"method": "none"})
+    X, y, med = _stage_matrix(samples, feature_names, stage)
+    prior = float(y.mean()) if len(y) else 0.5
+    if cal["method"] == "isotonic" and lab.sum() >= 50:
+        p_oos = _iso_apply(cal, z_oos[lab])
+        lam, lam_brier = _select_shrinkage(p_oos, y_oos[lab].astype(float), prior)
+        base_brier = float(np.mean((prior - y_oos[lab]) ** 2))
+    else:
+        lam, lam_brier, base_brier = 1.0, None, None
+    clf, mean, std = _fit_stage_raw(X, y, C)
+    artifact = {
+        "standardization": {"mean": dict(zip(feature_names, mean.tolist())),
+                            "std": dict(zip(feature_names, std.tolist()))},
+        "coefficients": dict(zip(feature_names, clf.coef_[0].tolist())),
+        "intercept": float(clf.intercept_[0]),
+        "calibration": cal,
+        "prior": prior,
+        "shrinkage": lam,
+        "C": C,
+        "oos_log_loss": ll,
+        "oos_brier_shrunk": lam_brier,
+        "oos_brier_prior_only": base_brier,
+        "oos_sample_size": int(lab.sum()),
+    }
+    return artifact, med, {"z": z_oos, "y": y_oos, "idx": idx_oos, "cal": cal, "C": C}
+
+
+def _stage_p(art, z):
+    """Stage probability exactly as marketlib.model computes it in production —
+    isotonic lookup then shrinkage toward the prior. Kept in lockstep with
+    marketlib.model._stage_probability; tests/test_parity.py pins them together."""
+    cal = art["calibration"]
+    p = _iso_apply(cal, z) if cal.get("method") == "isotonic" else 1 / (1 + np.exp(-z))
+    lam, prior = art.get("shrinkage"), art.get("prior")
+    if lam is not None and prior is not None:
+        p = prior + lam * (p - prior)
+    return np.clip(p, 0.0, 1.0)
+
+
+def _three_class_probs(mag_art, dir_art, X_std_mag, X_std_dir):
+    p_neu = _stage_p(mag_art, X_std_mag)
+    p_up = _stage_p(dir_art, X_std_dir)
+    return np.column_stack([(1 - p_neu) * p_up, p_neu, (1 - p_neu) * (1 - p_up)])
+
+
+def _z_for(art, X, feature_names):
+    mean = np.array([art["standardization"]["mean"][n] for n in feature_names])
+    std = np.array([art["standardization"]["std"][n] for n in feature_names])
+    std[std == 0] = 1.0
+    coef = np.array([art["coefficients"][n] for n in feature_names])
+    return ((X - mean) / std) @ coef + art["intercept"]
+
+
+def _multiclass_brier(P, truth_idx):
+    Y = np.zeros_like(P); Y[np.arange(len(truth_idx)), truth_idx] = 1.0
+    return float(np.mean(np.sum((P - Y) ** 2, axis=1)))
+
+
+def _confidence_tiers(top_probs, correct, baseline_correct=None,
+                      quantiles=(85, 50)):
+    """Confidence bands cut at OOS quantiles of the winning probability.
+
+    Cuts are data-driven rather than fixed at 0.60/0.50 because this model's
+    winning probability rarely clears 0.6 — a hard cut put 8 days in 高信心,
+    far too few for its hit rate to mean anything. Quantiles instead define 高
+    as "today is among the most confident ~15% of days", which keeps every band
+    large enough to carry a number worth reading.
+
+    Each tier records the hit rate MEASURED inside it on pooled walk-forward
+    OOS, next to the constant-guess hit rate over the same days, so a reader can
+    see whether the extra confidence bought anything.
+    """
+    hi_cut = float(np.percentile(top_probs, quantiles[0]))
+    mid_cut = float(np.percentile(top_probs, quantiles[1]))
+    tiers = []
+    for label, lo, hi in (("高", hi_cut, float("inf")),
+                          ("中", mid_cut, hi_cut),
+                          ("低", 0.0, mid_cut)):
+        m = (top_probs >= lo) & (top_probs < hi)
+        entry = {
+            "label": label, "min_prob": lo,
+            "oos_hit_rate": float(correct[m].mean()) if m.sum() else None,
+            "oos_sample_size": int(m.sum()),
+        }
+        if baseline_correct is not None and m.sum():
+            entry["oos_baseline_hit_rate"] = float(baseline_correct[m].mean())
+        tiers.append(entry)
+    return tiers
+
+
+def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
+                    rolling_windows=8):
+    os.makedirs(out_dir, exist_ok=True)
+    labeled = [s for s in samples if s.get("actual_direction") in DIRECTION_LABELS]
+    cut = len(labeled) - min(len(labeled) // 4, test_months * 21)
+    trainval, test = labeled[: max(0, cut - EMBARGO)], labeled[cut:]
+
+    mag_art, mag_med, mag_oos = _build_stage(trainval, feature_names, "magnitude")
+    dir_art, dir_med, dir_oos = _build_stage(trainval, feature_names, "direction")
+    med = {n: _nanmedian0([_get(s, n) for s in trainval]) for n in feature_names}
+
+    # --- confidence tiers from pooled walk-forward OOS (never in-sample) ---
+    # Building these from the trainval-fitted model's own trainval predictions
+    # would be in-sample and produced a non-monotonic table (高 scoring below 中).
+    # Align the two stages on the row indices they actually share.
+    mag_by_idx = dict(zip(mag_oos["idx"], mag_oos["z"]))
+    dir_by_idx = dict(zip(dir_oos["idx"], dir_oos["z"]))
+    shared = sorted(set(mag_by_idx) & set(dir_by_idx))
+    tiers = []
+    if shared:
+        P_oos = _three_class_probs(
+            mag_art, dir_art,
+            np.array([mag_by_idx[i] for i in shared]),
+            np.array([dir_by_idx[i] for i in shared]))
+        truth_oos = np.array([DIRECTION_LABELS.index(trainval[i]["actual_direction"])
+                              for i in shared])
+        tiers = _confidence_tiers(P_oos.max(axis=1),
+                                  (P_oos.argmax(axis=1) == truth_oos),
+                                  baseline_correct=(truth_oos == 1))
+
+    # --- honest evaluation on the held-out test window ---
+    Xte = np.array([[_imp(_get(s, n), med[n]) for n in feature_names] for s in test])
+    P = _three_class_probs(mag_art, dir_art,
+                           _z_for(mag_art, Xte, feature_names),
+                           _z_for(dir_art, Xte, feature_names))
+    truth = np.array([DIRECTION_LABELS.index(s["actual_direction"]) for s in test])
+    pred = P.argmax(axis=1)
+    recs, prev = [], None
+    for i, s in enumerate(test):
+        actual = s["actual_direction"]
+        recs.append({"prediction": DIRECTION_LABELS[pred[i]], "actual_direction": actual,
+                     "baselines": {"momentum": {"label": "今日方向延續",
+                                                "hit": (prev == actual) if prev else False}}})
+        prev = actual
+    cls = summarize_classification(recs)
+    base = summarize_baselines(recs)
+    hit = float((pred == truth).mean())
+    brier = _multiclass_brier(P, truth)
+    # Baseline = the constant a deployer could genuinely have shipped, i.e. the
+    # class prior measured on TRAINVAL. Using the test window's own prior instead
+    # would grade against a constant that had seen the future.
+    tv_prior = np.array([np.mean([s["actual_direction"] == lbl for s in trainval])
+                         for lbl in DIRECTION_LABELS])
+    brier_base = _multiclass_brier(np.tile(tv_prior, (len(truth), 1)), truth)
+    oracle_prior = np.array([(truth == k).mean() for k in range(3)])
+    brier_oracle = _multiclass_brier(np.tile(oracle_prior, (len(truth), 1)), truth)
+    model_hits = (pred == truth).tolist()
+    neu_hits = (truth == 1).tolist()
+    bull_hits = (truth == 0).tolist()
+
+    metrics = {
+        "artifact": "final_test_evaluation", "market": market,
+        "model_type": "two_stage_logistic",
+        "trained_on": [trainval[0]["date"], trainval[-1]["date"]],
+        "tested_on": [test[0]["date"], test[-1]["date"]] if test else None,
+        "chosen_params": {
+            "magnitude_C": mag_art["C"], "direction_C": dir_art["C"],
+            "magnitude_shrinkage": mag_art["shrinkage"],
+            "direction_shrinkage": dir_art["shrinkage"],
+        },
+        "metrics": {"hit_rate": hit, "macro_f1": cls["macro_f1"], "brier": brier,
+                    "brier_baseline": brier_base,
+                    "brier_skill": 1 - brier / brier_base if brier_base else None,
+                    "brier_baseline_oracle_prior": brier_oracle,
+                    "classification": cls},
+        "baselines": base,
+        "significance": {
+            "vs_always_neutral_mcnemar": mcnemar_test(model_hits, neu_hits),
+            "vs_always_neutral_bootstrap": block_bootstrap_diff(model_hits, neu_hits, seed=0),
+            "vs_always_bull_mcnemar": mcnemar_test(model_hits, bull_hits),
+            "vs_always_bull_bootstrap": block_bootstrap_diff(model_hits, bull_hits, seed=0),
+        },
+        "confidence_tiers": tiers,
+    }
+    # --- rolling-origin estimate: the number the deploy gate actually trusts ---
+    # Deferred import: validate.py imports this module.
+    if rolling_windows:
+        try:
+            import validate as V
+            per_window, pooled = V.rolling_validate(
+                labeled, feature_names, windows=rolling_windows, window_days=126)
+            if pooled:
+                metrics["rolling_validation"] = V.summarize(per_window, pooled)
+        except Exception as exc:  # noqa: BLE001 — never block a retrain on this
+            metrics["rolling_validation_error"] = str(exc)
+
+    metrics_path = os.path.join(out_dir, f"metrics_{market}.json")
+    with open(metrics_path, "w") as fh:
+        json.dump(metrics, fh, ensure_ascii=False, indent=2)
+
+    # --- production refit on ALL labeled rows (test window included) ---
+    mag_full, _, _ = _build_stage(labeled, feature_names, "magnitude")
+    dir_full, _, _ = _build_stage(labeled, feature_names, "direction")
+    med_all = {n: _nanmedian0([_get(s, n) for s in labeled]) for n in feature_names}
+    model = {
+        "artifact": "production_refit", "market": market,
+        "model_type": "two_stage_logistic",
+        "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "train_period": [labeled[0]["date"], labeled[-1]["date"]],
+        "note": ("Two-stage: P(震盪) from the magnitude stage, P(偏多|大動) from the "
+                 "direction stage; the three class probabilities are their product "
+                 "decomposition. Refit on ALL data including the test window — the "
+                 "hit_rate/Brier in metrics_*.json come from a model that never saw "
+                 "the test window and are the honest OOS estimate, NOT a test of this "
+                 "refit. Isotonic calibration and confidence tiers were fit on pooled "
+                 "trainval walk-forward OOS predictions."),
+        "feature_names": feature_names,
+        "imputation_median": med_all,
+        "stages": {"magnitude": mag_full, "direction": dir_full},
+        "confidence_tiers": tiers,
+        "oos_reference": {"hit_rate": hit, "brier": brier, "brier_baseline": brier_base,
+                          "tested_on": metrics["tested_on"]},
+    }
+    model_path = os.path.join(out_dir, f"model_{market}.json")
+    with open(model_path, "w") as fh:
+        json.dump(model, fh, ensure_ascii=False, indent=2)
+    return model_path, metrics_path
+
+
+def train_market(db, market, out_dir, test_months=18, seed=0, rolling_windows=8):
     from marketlib.store import HistoryStore
     from marketlib.features import build_dataset, FEATURE_NAMES_TW, FEATURE_NAMES_US
     store = HistoryStore(db)
@@ -285,10 +646,13 @@ def train_market(db, market, out_dir, test_months=18, seed=0):
         rows, us = store.get_us_rows(), []; names = FEATURE_NAMES_US
     samples = build_dataset(market, rows, us)
     store.close()
-    # 台股跳過 Platt 校準(弱訊號被校準壓成窄帶會使 bear 門檻永不觸發、退化被 gate 擋);
-    # 用原始 sigmoid 保留分散度。信心標籤因此為「未校準」。
+    # 台股走兩段式三分類(幅度 × 方向),各自用 pooled walk-forward OOS 做 isotonic
+    # 校準。舊的二分類 + 門檻切法把佔比最高的「震盪」壓到 recall 0.02,且校準失效。
+    if market == "tw":
+        return train_two_stage(samples, names, market, out_dir, test_months=test_months,
+                               rolling_windows=rolling_windows)
     return train_from_samples(samples, names, market, out_dir, test_months=test_months,
-                              seed=seed, use_platt=(market != "tw"))
+                              seed=seed, use_platt=True)
 
 def promote_if_passes(metrics_path, model_path, market, promote_dir):
     """Copy the freshly trained model into `promote_dir` (production) iff its OOS
@@ -311,12 +675,15 @@ def main() -> int:
     p.add_argument("--market", choices=["tw", "us"], required=True)
     p.add_argument("--out", default="models")
     p.add_argument("--test-months", type=int, default=18)
+    p.add_argument("--rolling-windows", type=int, default=8,
+                   help="滾動驗證窗口數（0 = 跳過）。gate 以此為準，優先於單一切點。")
     p.add_argument("--promote-if-passes", action="store_true",
                    help="若 OOS 通過部署 gate，複製 model_<market>.json 到 --promote-dir")
     p.add_argument("--promote-dir", default="models",
                    help="production 模型目錄（daily_market_report.py 讀取處）")
     a = p.parse_args()
-    mp, xp = train_market(a.db, a.market, a.out, test_months=a.test_months)
+    mp, xp = train_market(a.db, a.market, a.out, test_months=a.test_months,
+                          rolling_windows=a.rolling_windows)
     print(f"Wrote {mp}\nWrote {xp}")
     if a.promote_if_passes:
         promoted, reason = promote_if_passes(xp, mp, a.market, a.promote_dir)

@@ -195,3 +195,181 @@ def build_screener(
         res["rank"] = rank_idx
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Technical intersection — 0050 潛力股
+#
+# The composite score above ranks every stock against every other, so something
+# always comes out on top even when nothing looks good. This layer answers a
+# different question: does this stock satisfy ALL of a fixed set of technical
+# conditions at once? An empty result is a legitimate — and informative —
+# answer, which a ranking can never give.
+#
+# Three kinds of condition, deliberately separated:
+#   core   — the intersection proper. Every one must hold.
+#   veto   — disqualifies regardless of the rest (already overheated).
+#   bonus  — reported as supporting evidence, never gates.
+# ---------------------------------------------------------------------------
+
+RSI_OVERHEATED = 80.0
+VOLUME_EXPANSION = 1.0
+KD_OVERBOUGHT = 80.0
+MA20_GAP_STRETCHED = 0.15
+
+
+def _macd_bullish(macd: Optional[dict]) -> Optional[bool]:
+    if not macd:
+        return None
+    hist = macd.get("hist")
+    if macd.get("cross") == "golden":
+        return True
+    if macd.get("cross") == "dead":
+        return False
+    return None if hist is None else hist > 0
+
+
+def _core_conditions(m: dict) -> list[tuple[str, Optional[bool]]]:
+    """(readable condition, holds?) — None where the data cannot answer it."""
+    close, ma5, ma20, ma60 = m.get("close"), m.get("ma5"), m.get("ma20"), m.get("ma60")
+    kd = m.get("kd") or {}
+    k, d = kd.get("k"), kd.get("d")
+    return [
+        ("收盤站上月線（20日均）",
+         None if close is None or ma20 is None else close >= ma20),
+        ("均線多頭排列（5日 ≥ 20日 ≥ 60日）",
+         None if None in (ma5, ma20, ma60) else ma5 >= ma20 >= ma60),
+        ("日 MACD 翻多（柱狀轉正或黃金交叉）", _macd_bullish(m.get("macd_daily"))),
+        ("週 MACD 翻多（中期趨勢同向）", _macd_bullish(m.get("macd_weekly"))),
+        ("KD 金叉（K ≥ D）", None if k is None or d is None else k >= d),
+    ]
+
+
+def _veto_conditions(m: dict) -> list[tuple[str, bool]]:
+    rsi_val = m.get("rsi")
+    out = []
+    if rsi_val is not None and rsi_val >= RSI_OVERHEATED:
+        out.append((f"RSI {rsi_val:.0f} ≥ {RSI_OVERHEATED:.0f}，短線過熱", True))
+    return out
+
+
+def _bonus_conditions(m: dict) -> list[tuple[str, Optional[bool]]]:
+    close = m.get("close")
+    boll = m.get("boll") or {}
+    pctb = boll.get("pctb")
+    cost60 = m.get("cost_vwap60")
+    vol = m.get("volume_ratio_20d")
+    return [
+        ("布林通道位置偏上（%b > 0.5）", None if pctb is None else pctb > 0.5),
+        ("站上 60 日成本均價（大戶成本之上）",
+         None if close is None or cost60 is None else close >= cost60),
+        ("量能高於 20 日均量（買盤有跟上）",
+         None if vol is None else vol > VOLUME_EXPANSION),
+    ]
+
+
+def core_condition_texts() -> list[str]:
+    """The core conditions, in order, independent of any stock.
+
+    Every stock that passes satisfies all of them, so a report states them once
+    rather than repeating the identical list under each name.
+    """
+    return [text for text, _ in _core_conditions({})]
+
+
+def _metrics_snapshot(m: dict) -> dict:
+    """The numbers behind the verdict. Passing stocks are indistinguishable on
+    the conditions themselves — these values are what lets a reader rank them."""
+    close, ma20 = m.get("close"), m.get("ma20")
+    kd = m.get("kd") or {}
+    macd_d = m.get("macd_daily") or {}
+    macd_w = m.get("macd_weekly") or {}
+    boll = m.get("boll") or {}
+    return {
+        "close": close,
+        "rsi": m.get("rsi"),
+        "kd_k": kd.get("k"),
+        "kd_d": kd.get("d"),
+        "macd_hist": macd_d.get("hist"),
+        "macd_weekly_hist": macd_w.get("hist"),
+        "pctb": boll.get("pctb"),
+        "volume_ratio_20d": m.get("volume_ratio_20d"),
+        "close_vs_ma20": (close / ma20 - 1) if close is not None and ma20 else None,
+        "price_vs_cost60": m.get("price_vs_cost60"),
+    }
+
+
+def _warnings(m: dict) -> list[str]:
+    """Stretch signals: true but worth knowing, and never disqualifying.
+
+    A condition can be satisfied in a way that argues against buying. %b > 1
+    means the close is outside the upper band, not merely in the upper half of
+    it; a K above 80 is a golden cross made in overbought territory. Left
+    unflagged, the shortlist silently ranks the most extended names highest,
+    which is the opposite of what a screen is for. These stay warnings rather
+    than vetoes because whether an extended trend is an entry or an exit is a
+    judgement call, not something the data settles.
+    """
+    out: list[str] = []
+    boll = m.get("boll") or {}
+    pctb = boll.get("pctb")
+    if pctb is not None and pctb > 1.0:
+        out.append(f"收盤在布林上軌之外（%b {pctb:.2f}），短線延伸過度")
+    k = (m.get("kd") or {}).get("k")
+    if k is not None and k >= KD_OVERBOUGHT:
+        out.append(f"K 值 {k:.0f} 已在超買區（≥ {KD_OVERBOUGHT:.0f}）")
+    close, ma20 = m.get("close"), m.get("ma20")
+    if close is not None and ma20:
+        gap = close / ma20 - 1
+        if gap > MA20_GAP_STRETCHED:
+            out.append(f"距 20 日均線 +{gap:.0%}，正乖離偏大")
+    return out
+
+
+def technical_intersection(metrics: dict) -> dict:
+    """Evaluate one stock against the fixed technical intersection.
+
+    `metrics` is the dict from ``marketlib.stocks.technical_metrics``.
+
+    A condition that cannot be computed counts as NOT met and sets
+    ``insufficient_data``. Treating unknown as a pass would quietly promote
+    exactly the newly-listed or thinly-traded stocks we have least evidence
+    about, which is the opposite of what an intersection is for.
+
+    Returns a dict carrying, for every condition, whether it held — so the
+    report can show the reasoning rather than just a verdict.
+    """
+    core = _core_conditions(metrics)
+    vetoes = _veto_conditions(metrics)
+    bonus = _bonus_conditions(metrics)
+
+    core_passed = [text for text, ok in core if ok is True]
+    core_failed = [text for text, ok in core if ok is False]
+    unknown = [text for text, ok in core if ok is None]
+    core_failed += [f"{text}（資料不足，無法判定）" for text in unknown]
+
+    bonus_passed = [text for text, ok in bonus if ok is True]
+    bonus_failed = [text for text, ok in bonus if ok is False]
+    bonus_unknown = [text for text, ok in bonus if ok is None]
+
+    veto_texts = [text for text, hit in vetoes if hit]
+    is_candidate = not core_failed and not veto_texts
+
+    total = len(core) + len(bonus)
+    met = len(core_passed) + len(bonus_passed)
+
+    return {
+        "is_candidate": is_candidate,
+        "reasons": core_passed + bonus_passed,
+        "core_passed": len(core_passed),
+        "core_total": len(core),
+        "core_failed": core_failed,
+        "bonus_passed": len(bonus_passed),
+        "bonus_total": len(bonus),
+        "bonus_failed": bonus_failed + [f"{t}（資料不足）" for t in bonus_unknown],
+        "vetoes": veto_texts,
+        "insufficient_data": bool(unknown),
+        "score": met / total if total else 0.0,
+        "metrics_snapshot": _metrics_snapshot(metrics),
+        "warnings": _warnings(metrics),
+    }

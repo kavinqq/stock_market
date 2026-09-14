@@ -595,6 +595,19 @@ def model_prediction(market: str, model_path: str, rows: list, us_rows: list) ->
     present = sum(1 for n in check_names if feats.get(n) is not None)
     if present < len(check_names) // 2:   # 特徵大量缺 -> 退回規則式
         return None
+    if ml_model.is_two_stage(model):
+        probs = ml_model.predict_three_class(model, feats)
+        bias = ml_model.direction_from_probs(probs)
+        return {
+            "bias": bias,
+            "probability": round(probs[bias], 4),
+            "class_probabilities": {k: round(v, 4) for k, v in probs.items()},
+            "confidence": ml_model.confidence_from_probs(model, probs),
+            "confidence_calibrated": True,
+            "tier_evidence": ml_model.tier_evidence(model, probs),
+            "oos_reference": model.get("oos_reference"),
+            "model_version": model.get("trained_at", "unknown"),
+        }
     p = ml_model.predict_proba(model, feats)
     return {"bias": ml_model.proba_to_direction(model, p),
             "probability": round(p, 4),
@@ -1206,6 +1219,95 @@ def html_stock_2330_section(stock: Optional[dict[str, Any]]) -> str:
     )
 
 
+def markdown_intersection_block(screener: list[dict]) -> list[str]:
+    """The technical-intersection shortlist, with the reasoning spelled out.
+
+    Kept separate from the composite ranking below it because the two answer
+    different questions. The ranking always produces a top 15, even in a market
+    where nothing qualifies; the intersection can legitimately come back empty,
+    and that emptiness is itself the finding.
+    """
+    lines: list[str] = ["### 技術面交集（全部條件同時成立）", ""]
+    if not screener:
+        return lines + ["- 資料不足，無法計算技術面交集。", ""]
+
+    scored = [r for r in screener if r.get("intersection")]
+    if not scored:
+        return lines + ["- 個股技術指標資料不足，無法計算交集。", ""]
+
+    hits = [r for r in scored if r["intersection"]["is_candidate"]]
+    hits.sort(key=lambda r: (-r["intersection"]["score"], r.get("rank", 999)))
+
+    core_total = scored[0]["intersection"]["core_total"]
+    lines.append(
+        f"必要條件 {core_total} 項全數成立才列入；RSI ≥ {_screener.RSI_OVERHEATED:.0f} "
+        f"視為過熱直接排除。共 {len(scored)} 檔納入檢查，**{len(hits)} 檔通過**。"
+    )
+    lines.append("")
+    lines.append("必要條件（通過的個股一律全數成立，故僅列一次）：")
+    for text in _screener.core_condition_texts():
+        lines.append(f"1. {text}")
+    lines.append("")
+
+    if not hits:
+        # Name the stocks that came closest — a near-miss list is more useful
+        # than silence, as long as it is not dressed up as a pass.
+        near = sorted(scored, key=lambda r: len(r["intersection"]["core_failed"]))[:5]
+        lines.append("**本日無個股通過全部條件。** 最接近的幾檔與其卡關處：")
+        lines.append("")
+        for r in near:
+            ins = r["intersection"]
+            blockers = "；".join(ins["core_failed"] + ins["vetoes"]) or "—"
+            lines.append(
+                f"- **{r.get('code','')} {r.get('name','')}** "
+                f"(必要條件 {ins['core_passed']}/{ins['core_total']}) — 未過：{blockers}"
+            )
+        lines.append("")
+        return lines
+
+    lines.append("通過名單（依加分項與綜合排名排序，附指標數值供比較）：")
+    lines.append("")
+    lines.append("| 代號 | 名稱 | 加分 | 綜排 | 距月線 | KD (K/D) | RSI | MACD柱 | 布林%b | 量比 | 注意 |")
+    lines.append("|------|------|------|------|--------|----------|-----|--------|--------|------|------|")
+    for r in hits:
+        ins = r["intersection"]
+        m = ins["metrics_snapshot"]
+        kd_str = (f"{m['kd_k']:.0f}/{m['kd_d']:.0f}"
+                  if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
+        lines.append(
+            f"| {r.get('code','')} | {r.get('name','')} "
+            f"| {ins['bonus_passed']}/{ins['bonus_total']} | {r.get('rank','—')} "
+            f"| {fmt_pct(m.get('close_vs_ma20'))} | {kd_str} "
+            f"| {fmt_num(m.get('rsi'), 0)} | {fmt_num(m.get('macd_hist'), 2)} "
+            f"| {fmt_num(m.get('pctb'), 2)} | {fmt_num(m.get('volume_ratio_20d'), 2)} "
+            f"| {'⚠️ ' + str(len(ins['warnings'])) if ins['warnings'] else '—'} |"
+        )
+    lines.append("")
+    flagged = [r for r in hits if r["intersection"]["warnings"]]
+    if flagged:
+        lines.append("⚠️ 延伸過度提醒（條件仍成立，但屬追高風險，是否進場請自行判斷）：")
+        for r in flagged:
+            lines.append(f"- **{r.get('code','')} {r.get('name','')}**")
+            for w in r["intersection"]["warnings"]:
+                lines.append(f"  - {w}")
+        lines.append("")
+    partial = [r for r in hits if r["intersection"]["bonus_failed"]]
+    if partial:
+        lines.append("加分項未滿的個股與缺項：")
+        for r in partial:
+            lines.append(
+                f"- {r.get('code','')} {r.get('name','')} — "
+                + "；".join(r["intersection"]["bonus_failed"])
+            )
+        lines.append("")
+    lines.append(
+        "> 交集只描述技術面目前的狀態，不含未來報酬的統計驗證；"
+        "本清單未做過勝率回測，請當作篩選起點而非買賣訊號。"
+    )
+    lines.append("")
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     generated = report["generated_at"]
     tw = report["taiwan"]
@@ -1358,6 +1460,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     # --- 0050 潛力股 screener section ---
     screener = report.get("screener_0050") or []
     lines.extend(["", "## 0050 潛力股", ""])
+    lines.extend(markdown_intersection_block(screener))
     if not screener:
         lines.append("- 資料不足，無法顯示 0050 潛力股排名。")
     else:
@@ -2233,13 +2336,17 @@ def assemble_screener(
             "tech_raw": tech.get("tech_raw"),
             "ret20": tech.get("ret20"),
             "ret60": tech.get("ret60"),
+            "intersection": tech.get("intersection"),
         })
     ranked = _screener.build_screener(records)
-    # Re-attach name to ranked rows (build_screener may not carry it through)
-    name_by_code = {r["code"]: r.get("name", r["code"]) for r in records}
+    # Re-attach name and the technical intersection to ranked rows (build_screener
+    # only carries the fields it ranks on).
+    by_code = {r["code"]: r for r in records}
     for row in ranked:
+        src = by_code.get(row.get("code", ""), {})
         if "name" not in row or not row["name"]:
-            row["name"] = name_by_code.get(row.get("code", ""), row.get("code", ""))
+            row["name"] = src.get("name", row.get("code", ""))
+        row["intersection"] = src.get("intersection")
     return ranked
 
 
@@ -2350,12 +2457,80 @@ def build_screener_0050(end: date, store: "HistoryStore") -> list[dict]:
                     "tech_raw": tech_raw,
                     "ret20": tech_m.get("ret20"),
                     "ret60": tech_m.get("ret60"),
+                    "intersection": _screener.technical_intersection(tech_m),
                 }
         except Exception:  # noqa: BLE001
             # One failure never aborts the whole screener
             pass
 
     return assemble_screener(codes, valuation_by_code, revenue_by_code, chip_by_code, tech_by_code)
+
+
+def html_intersection_panel(screener_data: Optional[list[dict]]) -> str:
+    """HTML twin of markdown_intersection_block — the shortlist plus its reasons."""
+    if not screener_data:
+        return ""
+    scored = [r for r in screener_data if r.get("intersection")]
+    if not scored:
+        return ('<div class="panel"><h2>技術面交集</h2>'
+                '<p class="subtle">個股技術指標資料不足，無法計算交集。</p></div>')
+
+    hits = [r for r in scored if r["intersection"]["is_candidate"]]
+    hits.sort(key=lambda r: (-r["intersection"]["score"], r.get("rank", 999)))
+    core_total = scored[0]["intersection"]["core_total"]
+    core_list = "".join(f'<li>{esc(t)}</li>' for t in _screener.core_condition_texts())
+    head = (
+        f'<p class="subtle">必要條件 {core_total} 項全數成立才列入；'
+        f'RSI ≥ {_screener.RSI_OVERHEATED:.0f} 視為過熱直接排除。'
+        f'共 {len(scored)} 檔納入檢查，<strong>{len(hits)}</strong> 檔通過。</p>'
+        f'<p class="subtle">必要條件（通過者一律全數成立，故僅列一次）：</p>'
+        f'<ol class="subtle">{core_list}</ol>'
+    )
+
+    if not hits:
+        near = sorted(scored, key=lambda r: len(r["intersection"]["core_failed"]))[:5]
+        items = "".join(
+            f'<li><strong>{esc(r.get("code",""))} {esc(r.get("name",""))}</strong>'
+            f'（必要條件 {r["intersection"]["core_passed"]}/{r["intersection"]["core_total"]}）'
+            f'<br><span class="subtle">未過：'
+            f'{esc("；".join(r["intersection"]["core_failed"] + r["intersection"]["vetoes"]) or "—")}'
+            f'</span></li>'
+            for r in near
+        )
+        return ('<div class="panel"><h2>技術面交集</h2>' + head +
+                '<p><strong>本日無個股通過全部條件。</strong> 最接近的幾檔與其卡關處：</p>'
+                f'<ul>{items}</ul></div>')
+
+    body_rows = ""
+    for r in hits:
+        ins = r["intersection"]
+        m = ins["metrics_snapshot"]
+        kd_str = (f'{m["kd_k"]:.0f}/{m["kd_d"]:.0f}'
+                  if m.get("kd_k") is not None and m.get("kd_d") is not None else "N/A")
+        missing = "；".join(ins["bonus_failed"])
+        body_rows += (
+            f'<tr><td>{esc(r.get("code",""))}</td><td>{esc(r.get("name",""))}</td>'
+            f'<td>{ins["bonus_passed"]}/{ins["bonus_total"]}</td>'
+            f'<td>{r.get("rank","—")}</td>'
+            f'<td>{esc(fmt_pct(m.get("close_vs_ma20")))}</td>'
+            f'<td>{esc(kd_str)}</td>'
+            f'<td>{esc(fmt_num(m.get("rsi"), 0))}</td>'
+            f'<td>{esc(fmt_num(m.get("macd_hist"), 2))}</td>'
+            f'<td>{esc(fmt_num(m.get("pctb"), 2))}</td>'
+            f'<td>{esc(fmt_num(m.get("volume_ratio_20d"), 2))}</td>'
+            f'<td class="subtle">{esc(missing or "—")}</td>'
+            f'<td class="subtle">{esc("；".join(ins["warnings"]) or "—")}</td></tr>'
+        )
+    blocks = (
+        '<div style="overflow-x:auto"><table><thead><tr>'
+        '<th>代號</th><th>名稱</th><th>加分</th><th>綜排</th><th>距月線</th>'
+        '<th>KD (K/D)</th><th>RSI</th><th>MACD柱</th><th>布林%b</th><th>量比</th>'
+        '<th>加分缺項</th><th>延伸過度提醒</th>'
+        f'</tr></thead><tbody>{body_rows}</tbody></table></div>'
+    )
+    return ('<div class="panel"><h2>技術面交集</h2>' + head + blocks +
+            '<p class="subtle">交集只描述技術面目前的狀態，不含未來報酬的統計驗證；'
+            '本清單未做過勝率回測，請當作篩選起點而非買賣訊號。</p></div>')
 
 
 def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
@@ -2416,6 +2591,7 @@ def html_screener_0050_section(screener_data: Optional[list[dict]]) -> str:
         '<h1>0050 潛力股</h1>'
         '<div class="subtle">台灣50成分股橫截面多因子排名：估值 / 營收 / 技術 / 動能 / 籌碼。</div>'
         '</div>'
+        + html_intersection_panel(screener_data) +
         '<div class="panel">'
         '<h2>綜合排名</h2>'
         '<div style="overflow-x:auto">'
@@ -2541,6 +2717,12 @@ def main() -> int:
                 "bias": rule_pred["bias"],
                 "score": rule_pred["score"],
             }
+            # Carry the two-stage extras through so the reader sees the full
+            # distribution and the measured track record behind today's tier,
+            # not just a single word.
+            for key in ("class_probabilities", "tier_evidence", "oos_reference"):
+                if mp.get(key) is not None:
+                    report["predictions"][market_key][key] = mp[key]
             if not mp.get("confidence_calibrated", True):
                 md = list(report["predictions"][market_key].get("missing_data") or [])
                 md.append("信心為未校準機率（原始 sigmoid，僅供方向參考）")

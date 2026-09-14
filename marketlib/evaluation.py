@@ -76,13 +76,21 @@ def summarize_classification(records: list[dict[str, Any]]) -> dict[str, Any]:
         actual = actual_counts[label]
         precision = tp / predicted if predicted else None
         recall = tp / actual if actual else None
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if precision is not None and recall is not None and precision + recall > 0
-            else None
-        )
-        if f1 is not None:
+        if precision is not None and recall is not None and precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        # A class counts toward macro-F1 whenever it is "in play" — it either
+        # really occurs (support > 0) or the model claims it (predicted > 0).
+        # Such a class with no true positives scores 0, it is NOT dropped.
+        # Dropping it used to let a degenerate always-震盪 predictor post a
+        # higher macro-F1 than a genuine three-class model, so the deploy gate
+        # actively rewarded collapse. Only a class that neither occurs nor is
+        # ever predicted is excluded (it carries no information either way).
+        if actual or predicted:
             f1_scores.append(f1)
+        else:
+            f1 = None
         per_class[label] = {
             "precision": precision,
             "recall": recall,
@@ -137,6 +145,24 @@ def summarize_baselines(records: list[dict[str, Any]]) -> dict[str, Any]:
         actual = row.get("actual_direction")
         if actual in actual_counts:
             actual_counts[actual] += 1
+
+    # Constant-guess baselines, derived straight from the outcomes so they are
+    # always present even when the caller injected no per-row baselines. In TW
+    # 震盪 is the plurality class (~44%), which makes always_neutral — not
+    # always_bull and not random_prior — the bar a model must actually clear.
+    scored = sum(actual_counts.values())
+    for key, label_zh, cls in (
+        ("always_bull", "永遠偏多", "偏多"),
+        ("always_neutral", "永遠震盪", "震盪"),
+        ("always_bear", "永遠偏空", "偏空"),
+    ):
+        baselines[key] = {
+            "label": label_zh,
+            "sample_size": scored,
+            "hit_count": actual_counts[cls],
+            "hit_rate": actual_counts[cls] / scored if scored else None,
+        }
+
     if total:
         random_prior_rate = sum((count / total) ** 2 for count in actual_counts.values())
     else:

@@ -26,10 +26,30 @@ import json
 try:
     m = json.load(open("models/candidate_auto/metrics_tw.json"))
     me = m["metrics"]
-    rp = (m.get("baselines", {}).get("random_prior") or {}).get("expected_hit_rate")
+    b = m.get("baselines", {})
+    # Quote the rolling-origin number first: it is what the deploy gate trusts.
+    # The single held-out window swings several points with where the split
+    # lands (0.468 fixed vs 0.441 rolling on the 2026-09-14 retrain).
+    r = m.get("rolling_validation") or {}
+    parts = []
+    if r:
+        rb = r.get("baselines", {})
+        best = max([v for v in rb.values() if v is not None], default=0.0)
+        sig = (r.get("significance") or {}).get("vs_always_neutral_mcnemar", {})
+        parts.append(
+            f"rolling hit={r['hit_rate']:.3f} (n={r['pooled_sample_size']}, "
+            f"won {r.get('windows_won')}/{r.get('windows_total')}) "
+            f"vs best-constant {best:.3f} p={sig.get('p_value', float('nan')):.3f}"
+        )
     pc = {k: v.get("predicted_count") for k, v in me["classification"]["per_class"].items()}
-    print(f"hit={me['hit_rate']:.3f} macroF1={me['macro_f1']:.3f} "
-          f"random_prior={(rp or 0):.3f} pred_counts={pc} tested_on={m.get('tested_on')}")
+    parts.append(
+        f"fixed-split hit={me['hit_rate']:.3f} macroF1={me['macro_f1']:.3f} "
+        f"brier={me.get('brier', float('nan')):.4f}/"
+        f"{me.get('brier_baseline', float('nan')):.4f} "
+        f"always_neutral={(b.get('always_neutral') or {}).get('hit_rate', 0):.3f} "
+        f"pred_counts={pc} tested_on={m.get('tested_on')}"
+    )
+    print(" | ".join(parts))
 except Exception as e:
     print(f"(metrics summary unavailable: {e})")
 PY
@@ -41,6 +61,6 @@ git commit -q \
     -m "chore(model): TW self-tune snapshot $(date +%F)" \
     -m "$SUMMARY" \
     -m "Automated retrain+gate+promote via com.kuanlin.stockmarket.selftune." \
-    -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>" \
+    -m "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>" \
     -- models/model_tw.json
 echo "self_tune: committed model snapshot — $SUMMARY"

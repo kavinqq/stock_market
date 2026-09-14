@@ -70,6 +70,7 @@ def rolling_validate(samples, names, windows=6, window_days=126, min_train=500):
             "hit_rate": float((pred == truth).mean()),
             "always_neutral": float((truth == 1).mean()),
             "always_bull": float((truth == 0).mean()),
+            "always_bear": float((truth == 2).mean()),
             "brier": T._multiclass_brier(probs, truth),
         })
         for i, s in enumerate(test):
@@ -99,7 +100,8 @@ def summarize(per_window, pooled, train_prior=None):
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "pooled_sample_size": len(pooled),
         "windows_won": sum(1 for w in per_window
-                           if w["hit_rate"] > max(w["always_neutral"], w["always_bull"])),
+                           if w["hit_rate"] > max(w["always_neutral"], w["always_bull"],
+                                                  w["always_bear"])),
         "windows_total": len(per_window),
         "hit_rate": float(np.mean(model)),
         "macro_f1": cls["macro_f1"],
@@ -112,9 +114,15 @@ def summarize(per_window, pooled, train_prior=None):
         "baselines": {"always_neutral": float(np.mean(neutral)),
                       "always_bull": float(np.mean(bull)),
                       "always_bear": float(np.mean(bear))},
+        # One comparison per constant: edge_demonstrated() follows whichever
+        # baseline is strongest in the period, so all three must be available.
         "significance": {
             "vs_always_neutral_mcnemar": mcnemar_test(model, neutral),
             "vs_always_neutral_bootstrap": block_bootstrap_diff(model, neutral, seed=0),
+            "vs_always_bull_mcnemar": mcnemar_test(model, bull),
+            "vs_always_bull_bootstrap": block_bootstrap_diff(model, bull, seed=0),
+            "vs_always_bear_mcnemar": mcnemar_test(model, bear),
+            "vs_always_bear_bootstrap": block_bootstrap_diff(model, bear, seed=0),
         },
         "per_class": {k: {"precision": v["precision"], "recall": v["recall"],
                           "predicted_count": v["predicted_count"], "support": v["support"]}
@@ -161,7 +169,7 @@ def main() -> int:
           f"{report['pooled_sample_size']} days ===\n")
     print(f"{'window':<26}{'n':>5}{'model':>9}{'always震盪':>12}{'always偏多':>12}   verdict")
     for w in per_window:
-        best = max(w["always_neutral"], w["always_bull"])
+        best = max(w["always_neutral"], w["always_bull"], w["always_bear"])
         print(f"{w['from']}..{w['to']}{w['n']:>5}{w['hit_rate']:>9.4f}"
               f"{w['always_neutral']:>12.4f}{w['always_bull']:>12.4f}   "
               f"{'WIN' if w['hit_rate'] > best else 'lose'}")

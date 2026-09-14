@@ -50,8 +50,19 @@ ROWS = [
 ]
 
 
+MEDIAN = {"a": 1.0, "b": -2.0, "c": 0.5}
+
+
 def _train_side(rows):
-    X = np.array([[r[n] for n in FEATURES] for r in rows], dtype=float)
+    """The training-side computation, imputation included.
+
+    Imputation has to happen here too, via training's own `_imp`, or the
+    comparison is inference-against-inference and cannot detect the two sides
+    drifting apart — which is exactly how the NaN bug survived the first pass.
+    """
+    X = np.array([[T._imp(float(r.get(n, float("nan")) if r.get(n) is not None
+                                else float("nan")), MEDIAN[n])
+                   for n in FEATURES] for r in rows], dtype=float)
     return T._three_class_probs(MAG, DIR, T._z_for(MAG, X, FEATURES),
                                 T._z_for(DIR, X, FEATURES))
 
@@ -64,12 +75,50 @@ def test_training_and_inference_agree_on_every_class(row):
         assert got[label] == pytest.approx(expected[i], abs=1e-12)
 
 
-def test_agreement_holds_for_missing_and_nan_features():
-    """Both sides must land on the imputation median, by either route."""
-    baseline = ml_model.predict_three_class(MODEL, {"a": 1.0, "b": -2.0, "c": 0.5})
-    assert ml_model.predict_three_class(MODEL, {}) == baseline
-    assert ml_model.predict_three_class(
-        MODEL, {"a": float("nan"), "b": None, "c": float("nan")}) == baseline
+@pytest.mark.parametrize("row", [
+    {},                                                    # every feature absent
+    {"a": float("nan"), "b": None, "c": float("nan")},     # NaN and None mixed
+    {"a": 3.0, "b": float("nan"), "c": None},              # partially present
+])
+def test_agreement_holds_for_missing_and_nan_features(row):
+    """Compared against the TRAINING side, not against another inference call.
+
+    The earlier version of this test compared inference to inference, so it
+    would have passed even while training imputed NaN and inference did not —
+    the defect it exists to catch.
+    """
+    expected = _train_side([row])[0]
+    got = ml_model.predict_three_class(MODEL, row)
+    for i, label in enumerate(T.DIRECTION_LABELS):
+        assert got[label] == pytest.approx(expected[i], abs=1e-12)
+
+
+def test_the_parity_harness_would_notice_an_imputation_divergence():
+    """Guard on the guard: if inference stopped imputing NaN, this comparison
+    must fail. Pin that by checking the un-imputed path gives a different
+    answer, so a silently-passing test cannot go unnoticed."""
+    nan_row = {"a": float("nan"), "b": float("nan"), "c": float("nan")}
+    X_raw = np.array([[float("nan")] * len(FEATURES)])
+    unimputed = T._three_class_probs(MAG, DIR, T._z_for(MAG, X_raw, FEATURES),
+                                     T._z_for(DIR, X_raw, FEATURES))[0]
+    imputed = _train_side([nan_row])[0]
+    assert not np.allclose(np.nan_to_num(unimputed, nan=-1.0), imputed)
+
+
+@pytest.mark.parametrize("row", ROWS[:3])
+def test_parity_holds_on_the_uncalibrated_sigmoid_path(row):
+    """Stages without an isotonic table fall back to a plain sigmoid on both
+    sides; that branch needs pinning too."""
+    plain_mag = {k: v for k, v in MAG.items() if k != "calibration"}
+    plain_dir = {k: v for k, v in DIR.items() if k != "calibration"}
+    model = dict(MODEL, stages={"magnitude": plain_mag, "direction": plain_dir})
+    X = np.array([[row[n] for n in FEATURES]], dtype=float)
+    expected = T._three_class_probs(plain_mag, plain_dir,
+                                    T._z_for(plain_mag, X, FEATURES),
+                                    T._z_for(plain_dir, X, FEATURES))[0]
+    got = ml_model.predict_three_class(model, row)
+    for i, label in enumerate(T.DIRECTION_LABELS):
+        assert got[label] == pytest.approx(expected[i], abs=1e-12)
 
 
 def test_shrinkage_is_applied_on_both_sides():

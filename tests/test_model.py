@@ -374,3 +374,53 @@ def test_gate_reports_whether_an_edge_was_actually_demonstrated():
     m["rolling_validation"]["significance"]["vs_always_neutral_bootstrap"] = {
         "ci_low": 0.012, "ci_high": 0.058}
     assert ml_model.edge_demonstrated(m) is True
+
+
+def test_edge_verdict_uses_the_strongest_baseline_not_always_neutral():
+    """The verdict claims an edge over the best constant, so it must test
+    against the best constant. Reading only the always-震盪 comparison would
+    make the claim refer to the wrong competitor in a trending period."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE,
+                      brier=0.2366, brier_base=0.2461)
+    m["rolling_validation"] = {
+        "hit_rate": 0.44, "pooled_sample_size": 1008,
+        "baselines": {"always_neutral": 0.40, "always_bull": 0.43},
+        "significance": {
+            "vs_always_neutral_bootstrap": {"ci_low": 0.02, "ci_high": 0.06},
+            "vs_always_bull_bootstrap": {"ci_low": -0.01, "ci_high": 0.03},
+        },
+    }
+    # always_bull is the stronger baseline here and its CI crosses zero.
+    assert ml_model.edge_demonstrated(m) is False
+
+
+def test_edge_verdict_is_unknown_rather_than_false_without_evidence():
+    """"No edge" and "we could not measure" are different statements; reporting
+    the second as the first asserts a confidence interval that never existed."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE)
+    assert ml_model.edge_demonstrated(m) is None
+
+
+def test_two_stage_metrics_without_rolling_validation_cannot_promote():
+    """Absent rolling results — an empty run, or --rolling-windows 0 — must not
+    quietly fall back to the single split. Only an artifact that never claimed
+    to be two-stage may be judged on the fixed split alone."""
+    m = _gate_metrics(0.468, {"偏多": 65, "震盪": 297, "偏空": 16}, BASE,
+                      brier=0.2366, brier_base=0.2461)
+    m["model_type"] = "two_stage_logistic"
+    ok, reason = ml_model.passes_deploy_gate(m)
+    assert ok is False
+    assert "滾動驗證" in reason
+
+    m["rolling_validation"] = {"hit_rate": 0.4405, "pooled_sample_size": 1008,
+                               "baselines": {"always_neutral": 0.4325}}
+    assert ml_model.passes_deploy_gate(m)[0] is True
+
+
+def test_confidence_defaults_to_low_only_when_tiers_exist():
+    """An artifact with no tiers must not silently label everything 低 as if it
+    had measured that — the absence has to be visible."""
+    m = _two_stage_model()
+    m["confidence_tiers"] = []
+    assert ml_model.confidence_from_probs(m, {"偏多": 0.9, "震盪": 0.05,
+                                              "偏空": 0.05}) == "未知"

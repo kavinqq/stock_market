@@ -247,7 +247,7 @@ def _core_conditions(m: dict) -> list[tuple[str, Optional[bool]]]:
     ]
 
 
-def _veto_conditions(m: dict) -> list[tuple[str, bool]]:
+def _veto_conditions(m: dict) -> list[tuple[str, bool, bool]]:
     """Disqualifiers. An unanswerable veto disqualifies too.
 
     The veto asks "is RSI below 80?". With no RSI the answer is unknown, and
@@ -256,9 +256,12 @@ def _veto_conditions(m: dict) -> list[tuple[str, bool]]:
     """
     rsi_val = m.get("rsi")
     if rsi_val is None or rsi_val != rsi_val:  # None or NaN
-        return [("RSI 無法計算，過熱與否無法判定", True)]
+        # (text, disqualifies, unanswerable) — the third field is explicit
+        # rather than inferred from the wording, so rephrasing or translating
+        # the message cannot silently change the semantics.
+        return [("RSI 無法計算，過熱與否無法判定", True, True)]
     if rsi_val >= RSI_OVERHEATED:
-        return [(f"RSI {rsi_val:.0f} ≥ {RSI_OVERHEATED:.0f}，短線過熱", True)]
+        return [(f"RSI {rsi_val:.0f} ≥ {RSI_OVERHEATED:.0f}，短線過熱", True, False)]
     return []
 
 
@@ -361,8 +364,8 @@ def technical_intersection(metrics: dict) -> dict:
     bonus_failed = [text for text, ok in bonus if ok is False]
     bonus_unknown = [text for text, ok in bonus if ok is None]
 
-    veto_texts = [text for text, hit in vetoes if hit]
-    unanswerable_veto = any("無法" in t for t in veto_texts)
+    veto_texts = [text for text, hit, _ in vetoes if hit]
+    unanswerable_veto = any(unknown_ for _, hit, unknown_ in vetoes if hit)
     is_candidate = not core_failed and not veto_texts
 
     total = len(core) + len(bonus)

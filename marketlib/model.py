@@ -169,8 +169,13 @@ def confidence_from_probs(model: dict, probs: dict) -> str:
     rate is recorded next to them at training time, so "高" means a rate we
     actually observed rather than a feeling about the spread of the sigmoid.
     """
+    tiers = model.get("confidence_tiers") or []
+    if not tiers:
+        # No measured bands means we cannot say how much this call is worth.
+        # Returning 低 would look like a measurement rather than its absence.
+        return "未知"
     top = max(probs.values()) if probs else 0.0
-    for tier in model.get("confidence_tiers") or []:
+    for tier in tiers:
         if top >= tier.get("min_prob", 0.0):
             return tier.get("label", "低")
     return "低"
@@ -190,21 +195,42 @@ def tier_evidence(model: dict, probs: dict) -> Optional[dict]:
     return None
 
 
-def edge_demonstrated(metrics: dict) -> bool:
-    """Whether the model's advantage over the best constant survives its own
-    error bars — a strictly stronger claim than passing the deploy gate.
+_BASELINE_BOOTSTRAP = {
+    "always_neutral": "vs_always_neutral_bootstrap",
+    "always_bull": "vs_always_bull_bootstrap",
+    "always_bear": "vs_always_bear_bootstrap",
+}
 
-    A model can be worth deploying (calibrated probabilities, no worse than a
-    constant) while having no proven edge. TW is exactly that case: 0.4405 vs
-    0.4325 across eight rolling windows, bootstrap CI [-0.016, +0.032]. Keeping
-    the two claims separate is what stops the report from asserting skill the
-    data does not support.
+
+def edge_demonstrated(metrics: dict) -> Optional[bool]:
+    """Does the advantage over the STRONGEST constant survive its own error bars?
+
+    A strictly stronger claim than passing the deploy gate: a model can be worth
+    deploying (calibrated probabilities, no worse than a constant) while having
+    no proven edge. TW is exactly that — 0.4405 vs 0.4325 over eight rolling
+    windows, bootstrap CI [-0.016, +0.032]. Keeping the two claims apart is what
+    stops the report asserting skill the data does not support.
+
+    Tri-state on purpose. None means "not measured", which is not the same
+    statement as False ("measured, and the interval crossed zero") — reporting
+    the first as the second would assert an interval that was never computed.
+
+    The comparison follows whichever constant is actually strongest in the
+    period; testing only against always-震盪 would name the wrong competitor in
+    a trending market.
     """
     rolling = metrics.get("rolling_validation") or {}
-    boot = ((rolling.get("significance") or {})
-            .get("vs_always_neutral_bootstrap") or {})
+    baselines = rolling.get("baselines") or {}
+    sig = rolling.get("significance") or {}
+    rated = [(k, v) for k, v in baselines.items() if v is not None]
+    if not rated or not sig:
+        return None
+    strongest = max(rated, key=lambda kv: kv[1])[0]
+    boot = sig.get(_BASELINE_BOOTSTRAP.get(strongest, "")) or {}
     ci_low = boot.get("ci_low")
-    return ci_low is not None and ci_low > 0
+    if ci_low is None:
+        return None
+    return ci_low > 0
 
 
 def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
@@ -278,6 +304,14 @@ def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
     # rolling estimate is available it is the one that decides. TW showed 0.468
     # on the fixed split (p=0.008 vs always-震盪) but 0.441 across eight rolling
     # windows (p=0.57): the fixed split was period luck, not skill.
+    if (metrics.get("model_type") == "two_stage_logistic"
+            and not (metrics.get("rolling_validation") or {}).get("hit_rate")):
+        # A two-stage artifact is expected to carry a rolling estimate. An empty
+        # run or --rolling-windows 0 must not quietly hand the decision back to
+        # the single split; only artifacts that never claimed to be two-stage
+        # may be judged on the fixed split alone.
+        return False, "滾動驗證缺漏：two_stage 模型必須附滾動驗證結果才可部署"
+
     if metrics.get("rolling_validation_error"):
         # Fail closed. Falling back to the single split when validation crashes
         # would promote on exactly the evidence this gate exists to distrust.
@@ -306,6 +340,8 @@ def passes_deploy_gate(metrics: dict) -> tuple[bool, str]:
         detail += f"，Brier {brier:.4f} < 常數 {brier_baseline:.4f}"
     if r_hit is not None:
         detail += f"，滾動驗證 {r_hit:.3f}（n={rolling.get('pooled_sample_size')}）"
-        detail += ("；優勢通過信賴區間檢定" if edge_demonstrated(metrics)
-                   else "；但優勢未通過信賴區間檢定（與最強常數無顯著差異）")
+        edge = edge_demonstrated(metrics)
+        detail += {True: "；優勢通過信賴區間檢定",
+                   False: "；但優勢未通過信賴區間檢定（與最強常數無顯著差異）",
+                   None: "；優勢未經信賴區間檢定（無區間資料）"}[edge]
     return True, detail

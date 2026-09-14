@@ -1324,7 +1324,8 @@ def markdown_model_credibility(pred: dict[str, Any]) -> list[str]:
     lines = ["", "### 這個預測值多少（可信度）", ""]
     lines.append(
         "- 三類機率："
-        + "、".join(f"{k} {v:.1%}" for k, v in probs.items())
+        + "、".join(f"{k} {v:.1%}" if isinstance(v, (int, float)) else f"{k} N/A"
+                    for k, v in probs.items())
         + "（已校準，總和為 1）"
     )
 
@@ -1355,13 +1356,19 @@ def markdown_model_credibility(pred: dict[str, Any]) -> list[str]:
             line += f"，最強常數基準 {best:.1%}"
         lines.append(line)
 
-    if pred.get("edge_demonstrated") is False:
+    edge = pred.get("edge_demonstrated")
+    if edge is None:
+        lines.append(
+            "- 本次未取得滾動驗證的信賴區間，**無法判定**模型相對常數基準是否有優勢；"
+            "請僅將機率視為參考。"
+        )
+    elif edge is False:
         lines.append(
             "- ⚠️ **整體而言，本模型相對「永遠猜震盪」的優勢未通過信賴區間檢定**"
             "（差異的 95% 區間跨越 0）。它的價值在於已校準的機率與高信心日的篩選，"
             "不在於每日方向本身。"
         )
-    elif pred.get("edge_demonstrated") is True:
+    elif edge is True:
         lines.append("- 模型相對最強常數基準的優勢通過信賴區間檢定。")
     return lines
 

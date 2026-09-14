@@ -447,8 +447,9 @@ def _build_stage(samples, feature_names, stage):
 def _stage_p(art, z):
     """Stage probability exactly as marketlib.model computes it in production —
     isotonic lookup then shrinkage toward the prior. Kept in lockstep with
-    marketlib.model._stage_probability; tests/test_parity.py pins them together."""
-    cal = art["calibration"]
+    marketlib.model._stage_probability; tests/test_two_stage_parity.py pins the
+    two together across imputation, interpolation, clipping and shrinkage."""
+    cal = art.get("calibration") or {}
     p = _iso_apply(cal, z) if cal.get("method") == "isotonic" else 1 / (1 + np.exp(-z))
     lam, prior = art.get("shrinkage"), art.get("prior")
     if lam is not None and prior is not None:
@@ -610,6 +611,13 @@ def train_two_stage(samples, feature_names, market, out_dir, test_months=18,
     with open(metrics_path, "w") as fh:
         json.dump(metrics, fh, ensure_ascii=False, indent=2)
 
+    # A two-stage artifact without a rolling estimate has no confidence tiers and
+    # no honest headline. Writing one anyway would produce a model that labels
+    # every day 未知 and, run with the default --out, could land straight in the
+    # production directory. Stop at the metrics file instead.
+    if not tiers:
+        return None, metrics_path
+
     # --- production refit on ALL labeled rows (test window included) ---
     mag_full, _, _ = _build_stage(labeled, feature_names, "magnitude")
     dir_full, _, _ = _build_stage(labeled, feature_names, "direction")
@@ -687,7 +695,11 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db", default="data/history.db")
     p.add_argument("--market", choices=["tw", "us"], required=True)
-    p.add_argument("--out", default="models")
+    # NOT "models": that is the production directory the daily report reads, so
+    # a plain `train.py --market tw` would overwrite the live model without ever
+    # consulting the deploy gate. Training writes a candidate; only
+    # --promote-if-passes moves it into production.
+    p.add_argument("--out", default="models/candidate")
     p.add_argument("--test-months", type=int, default=18)
     p.add_argument("--rolling-windows", type=int, default=8,
                    help="滾動驗證窗口數（0 = 跳過）。gate 以此為準，優先於單一切點。")
@@ -698,7 +710,11 @@ def main() -> int:
     a = p.parse_args()
     mp, xp = train_market(a.db, a.market, a.out, test_months=a.test_months,
                           rolling_windows=a.rolling_windows)
-    print(f"Wrote {mp}\nWrote {xp}")
+    print(f"Wrote {xp}")
+    if mp is None:
+        print("未輸出模型：滾動驗證缺漏，此次訓練不產生可部署的模型檔。")
+        return 1
+    print(f"Wrote {mp}")
     if a.promote_if_passes:
         promoted, reason = promote_if_passes(xp, mp, a.market, a.promote_dir)
         if promoted:

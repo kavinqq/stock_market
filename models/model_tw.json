@@ -2,7 +2,7 @@
   "artifact": "production_refit",
   "market": "tw",
   "model_type": "two_stage_logistic",
-  "trained_at": "2026-09-24T20:07:32",
+  "trained_at": "2026-09-25T20:06:31",
   "train_period": [
     "2015-01-05",
     "2026-09-23"

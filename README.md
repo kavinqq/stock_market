@@ -1,98 +1,149 @@
-# Stock Market Daily Report
+# stock_market — Taiwan Market Daily Desk
 
-每天自動抓台股與美股大盤資料，產出規則式分析報告，不會呼叫 LLM，也不會消耗 token。
+A self-hosted pipeline that runs every weekday after the Taiwan close. It pulls public market data, writes a single-page HTML/Markdown report, predicts the **next trading day's direction** for the TAIEX, and later grades its own predictions against what actually happened.
 
-## 直接跑一次
+It also retrains its model every evening. A new model is **deployed only if it beats the simplest possible baselines on out-of-sample data**.
+
+![Daily report overview](docs/screenshot.png)
+
+> This is a research/learning project. Nothing here is investment advice.
+
+---
+
+## Why this project is interesting
+
+Most "stock prediction" side projects report one impressive accuracy number. This one is built around the opposite question: **how do I know I'm not fooling myself?**
+
+| Problem | What this project does about it |
+|---|---|
+| Look-ahead bias | Every stored source field carries an `*_asof_taipei` timestamp. A feature can be used only if its data was published before the 18:30 Asia/Taipei decision time (`marketlib/features.py`). |
+| One lucky train/test split | `validate.py` runs **rolling-origin validation**: it retrains before each window, scores the days after it, and pools the results. The deploy gate uses this number, not the single split. |
+| "70% accuracy!" in a market that is flat 43% of the time | Every metric is reported next to constant baselines: always-up, always-flat, persistence, and class-prior random. A **McNemar test** checks whether the edge over the best baseline is statistically real. |
+| Good hit rate with bad probabilities | The gate also requires the model's **Brier score** to beat a constant-probability forecast. |
+| Silent model drift | `self_tune.sh` retrains every night, promotes a candidate only if it passes the gate, and commits each promoted model as a version record. |
+
+### Honest current result
+
+These numbers come from the self-tune log on 2026-10-30. The TW model is a two-stage logistic regression with 22 features, trained on 2015-01 → 2026-10.
+
+| Metric | Model | Best constant baseline |
+|---|---|---|
+| Rolling-origin hit rate (n = 1008, 8 windows) | **0.453** | 0.444 |
+| Fixed-split hit rate | 0.471 | 0.429 (always "flat") |
+| Brier score | 0.6400 | 0.6474 |
+| McNemar p-value vs. best constant | 0.488 | — |
+
+So the model does slightly better than the baselines, but **not significantly better**. On roughly half of the evenings, the gate rejects the retrained candidate. The report states this openly.
+
+---
+
+## What the daily report contains
+
+The report is a single static HTML file (no server, no JS framework). Its sidebar has these sections:
+
+- **Overview**: index close, volume ratio, overnight SPY / QQQ / VIX, and a short conclusion
+- **Prediction**: next-day direction (up / flat / down), calibrated probabilities, and a confidence tier
+- **Accuracy**: a running scorecard of past predictions vs. actual closes, with a confusion matrix, macro-F1, per-class precision/recall, a price/volume diagnostic backtest, and tagged reasons for each miss
+- **Taiwan market**: moving averages, drawdown, margin balance, institutional net buy/sell, and futures open interest
+- **Cross-market read**: how the US session is likely to carry into Taiwan
+- **TSMC (2330)**: a single-stock readout across several facets
+- **0050 screener**: a cross-sectional ranking of the Taiwan 50 constituents
+- **Data sources**: how fresh each upstream feed is
+
+The "flat" band adapts to the market. It is half of the 60-day realised daily volatility, clamped to 0.3%–0.9%. Each prediction stores the threshold it used, so later grading stays consistent.
+
+---
+
+## Architecture
+
+```
+                 ┌─────────────── weekday 18:30 (cron) ───────────────┐
+ TWSE / TAIFEX ─▶│ daily_market_report.py                              │──▶ reports/YYYY-MM-DD.{html,md}
+ Nasdaq / Cboe ─▶│   fetch → indicators → model inference → grade past │──▶ data/YYYY-MM-DD.json
+ FINRA         ─▶│   predictions → render                              │──▶ data/evaluation_history.json
+                 └─────────────────────────────────────────────────────┘
+
+                 ┌─────────────── weekday 20:00 (launchd) ────────────┐
+ data/history.db▶│ self_tune.sh → train.py --rolling-windows           │──▶ models/candidate_auto/
+  (SQLite, PIT)  │   → deploy gate → promote? → git commit model       │──▶ models/model_tw.json
+                 └─────────────────────────────────────────────────────┘
+
+ backfill.py       loads years of point-in-time history into SQLite (request budget, retry, resume)
+ refresh_stocks.py refreshes TW50 daily bars without hitting rate limits (resumes via ingest_log)
+```
+
+| Module | Responsibility |
+|---|---|
+| `marketlib/fetchers.py` | Market-level fetchers for TWSE, TAIFEX, Nasdaq, Cboe and FINRA |
+| `marketlib/stocks.py` | Per-stock TWSE fetchers and technical indicators. Parsers are pure functions tested with fixtures. |
+| `marketlib/store.py` | SQLite schema that records an availability timestamp for every source |
+| `marketlib/features.py` | Causal feature engineering and the point-in-time availability rule |
+| `marketlib/model.py` | Two-stage logistic model stored as JSON, with isotonic calibration. Inference uses only the standard library. |
+| `marketlib/evaluation.py` | Labels, the adaptive flat band, and classification metrics |
+| `marketlib/stats.py` | McNemar significance test |
+| `marketlib/screener.py` | Cross-sectional scoring across several facets |
+
+**Design choice:** the daily report runs on the **Python standard library only**, so cron can use the system `python3`. numpy and scikit-learn are needed only for offline training and validation.
+
+---
+
+## Getting started
+
+You need Python 3.9+ for the daily report and Python 3.11 for training.
 
 ```bash
-cd /Users/kuanlin/stock_market
-/usr/bin/python3 daily_market_report.py
+git clone https://github.com/kavinqq/stock_market.git
+cd stock_market
+
+# 1. Daily report (no dependencies)
+python3 daily_market_report.py                 # today (Asia/Taipei)
+python3 daily_market_report.py --date 2026-10-30
+open reports/latest.html
+
+# 2. Training stack (optional)
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python backfill.py --start 2015-01-01 --max-requests 500   # resumable; re-run until done
+python backfill.py --coverage                               # coverage summary, no network
+python train.py --market tw --rolling-windows 8 --out models/candidate
+python validate.py --market tw                              # rolling-origin report
 ```
 
-輸出：
-
-- `reports/latest.html`
-- `reports/YYYY-MM-DD.html`
-- `reports/latest.md`
-- `reports/YYYY-MM-DD.md`
-- `data/latest.json`
-- `data/YYYY-MM-DD.json`
-- `data/evaluation_history.json`
-
-HTML 報告是單檔靜態頁，左側 sidebar 分成：
-
-- `總覽`
-- `預測`
-- `準確率`
-- `台股`
-- `美股`
-- `回推`
-- `資料源`
-
-## 每日預測與驗證
-
-每天腳本會自動做：
-
-1. 產生台股 / 美股下一交易日方向預測。
-2. 讀取過去 `data/*.json` 內保存的預測。
-3. 對照目前抓到的實際收盤資料。
-4. 記錄命中、失準、實際漲跌、公式版本、預測理由、缺少資料源與失準原因。
-5. 更新 `data/evaluation_history.json`，供後續用 AI 分析、調權重或訓練。
-
-### 驗證方法
-
-- 正式成績單：只看每天實際產出的預測，等後續收盤資料出現後再對照，累積在 `data/evaluation_history.json`。
-- 價量診斷回測：只用歷史價格與量能重跑子模型，目的是檢查價量規則，不代表正式模型完整準確率。
-- Baseline：報告同時列出永遠偏多、今日方向延續、依實際類別先驗隨機三個對照，避免單看命中率。
-- 三分類指標：除了 accuracy，也保存 macro-F1、每類 precision/recall/F1、confusion matrix。
-- 震盪判定：實際方向的中性帶用近 60 日收盤日報酬波動的一半，並限制在 0.3% 到 0.9%；每筆預測會保存當時門檻。
-- 量能比：成交量或成交金額除以前 20 個交易日均量，不把當日放進分母。
-
-失準原因會分類成例如：
-
-- 公式門檻過保守
-- 公式權重過強
-- 量價權重未捕捉隔日反轉
-- 缺少消息面、期貨、利率、匯率、籌碼歷史等資料源
-- 交易所假日造成 target date 調整
-
-## 安裝 crontab
+### Schedule it
 
 ```bash
-cd /Users/kuanlin/stock_market
-./install_cron.sh
+./install_cron.sh   # adds a weekday 18:30 crontab entry for the daily report
 ```
 
-預設排程：
+`launchd/` contains a sample macOS agent that runs `self_tune.sh` on weekdays at 20:00. Before loading it, change the paths inside to match your machine.
 
-```cron
-30 18 * * 1-5 cd "/Users/kuanlin/stock_market" && /usr/bin/python3 "/Users/kuanlin/stock_market/daily_market_report.py" >> "/Users/kuanlin/stock_market/logs/market_report.log" 2>&1 # stock_market_daily_report
+### Run the tests
+
+```bash
+python -m unittest discover -s tests    # 190 tests; parsers run against fixtures
 ```
 
-這個時間點適合台北時間：台股已收盤、TWSE 日資料通常已更新；美股則使用最近一個已收盤交易日。
+---
 
-## 資料源
+## Data sources
 
-- TWSE `FMTQIK`：台股每日成交資訊
-- TWSE `MI_MARGN`：上市信用交易統計
-- TWSE `BFI82U`：三大法人買賣金額統計
-- Nasdaq historical API：SPY / QQQ / IWM / COMP 價量
-- Cboe VIX History：VIX
-- FINRA Margin Statistics：美股 margin debt 月資料
+| Source | Data |
+|---|---|
+| TWSE `FMTQIK`, `MI_MARGN`, `BFI82U`, `STOCK_DAY` | Index turnover, margin balance, institutional flows, per-stock daily bars |
+| TAIFEX | Foreign and institutional open interest in TX futures |
+| Nasdaq historical API | SPY, QQQ, IWM, Nasdaq Composite |
+| Cboe | VIX history |
+| FINRA | Monthly margin statistics |
 
-## 分析邏輯
+All sources are public. The fetchers keep request rates low, using a per-run request budget and backoff. If you fork this project, please keep that behaviour.
 
-腳本會計算：
+---
 
-- 1日、5日、20日、60日漲跌
-- 5日、20日、60日均線
-- 成交量或成交金額相對前 20 日均量
-- 20日與60日高點回落幅度
-- 台股融資餘額變化
-- 台股三大法人買賣超
-- 美股 FINRA margin debt 月變化與年變化
-- VIX 風險狀態
+## Development process
 
-目前沒有納入 PE、PB、EPS、殖利率等基本面，因為本腳本預測的是下一交易日方向，估值資料更適合週到月級別判斷。後續比較值得補的是台指期夜盤、美股期貨、美元/台幣、SOX、TSM ADR、利率與重大新聞事件。
+Each feature went through the same steps: a written design spec, then an implementation plan, then test-first tasks. The specs and plans are in `docs/superpowers/specs/` and `docs/superpowers/plans/`, written in Traditional Chinese.
 
-報告是規則式市場分析，不是投資建議。
+## License
+
+[MIT](LICENSE) © 2026 KuanLin
